@@ -1,17 +1,130 @@
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
+import base64
+import json
+import fitz
+from pdf2image import convert_from_path
+import pytesseract
+import docx
+
+
 
 class Agent():
-    def __init__(self):
+    def __init__(self, db_connector, searching_model = "deepseek-v3.2", OCR_model = "kimi-k2.6", fast_model = "glm-4.7-flash", thinking_model = "deepseek-v4-pro"):
         load_dotenv()
         self.client = OpenAI(api_key=os.getenv("MORPHEUS_API_KEY"), base_url=os.getenv("MORPHEUS_BASE_URL"))
+        self.searching_model = searching_model
+        self.OCR_model = OCR_model
+        self.fast_model = fast_model
+        self.thinking_model = thinking_model
+        self.db_connector = db_connector
 
-    def __get_invoices(self, invoice_ID, db_connector):
-        db_connector.retrieve_data("invoices", condition=f"WHERE `invoice_ID` in {invoice_ID}")
+    def __pdf_extraction(self, pdf_path, sample_pages=3):
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"The file {pdf_path} was not found.")
 
-    def validate_transaction(self, invoice_ID, db_connector):
-        invoice = self.__get_invoices(invoice_ID, db_connector)
+        extracted_text = []
+        is_scanned = False
+
+        # Step 1: Check if the PDF is scanned or digital
+        try:
+            with fitz.open(pdf_path) as doc:
+                text_length = 0
+                pages_to_check = min(sample_pages, len(doc))
+
+                for i in range(pages_to_check):
+                    page = doc[i]
+                    text = page.get_text().strip()
+                    text_length += len(text)
+
+                # If text is extremely sparse, we assume it's scanned/image-based
+                if text_length < 10:
+                    is_scanned = True
+        except Exception as e:
+            print(f"Error reading PDF metadata: {e}. Defaulting to OCR.")
+            is_scanned = True
+
+        # Step 2: Route to the correct extraction logic
+        if is_scanned:
+            print(f"--> '{pdf_path}' detected as SCANNED. Extracting with Tesseract OCR...")
+            try:
+                images = convert_from_path(pdf_path)
+                for page_num, image in enumerate(images):
+                    text = pytesseract.image_to_string(image)
+                    extracted_text.append(f"--- Page {page_num + 1} ---\n{text}")
+            except Exception as e:
+                raise RuntimeError(f"OCR Extraction failed: {e}")
+
+        else:
+            print(f"--> '{pdf_path}' detected as DIGITAL. Extracting with PyMuPDF...")
+            try:
+                with fitz.open(pdf_path) as doc:
+                    for page_num, page in enumerate(doc):
+                        text = page.get_text()
+                        extracted_text.append(f"--- Page {page_num + 1} ---\n{text}")
+            except Exception as e:
+                raise RuntimeError(f"Digital Extraction failed: {e}")
+
+        # Step 3: Return the combined text string
+        return "\n".join(extracted_text)
+
+    def __word_doc_extraction(self, docx_path):
+        # Load the Word document
+        doc = docx.Document(docx_path)
+        extracted_text = []
+
+        # Iterate through each paragraph in the document
+        for paragraph in doc.paragraphs:
+            # Ignore completely empty lines
+            if paragraph.text.strip():
+                extracted_text.append(paragraph.text)
+
+        # Join the paragraphs back together with line breaks
+        return "\n".join(extracted_text)
+
+    def __prompt(self, model, messages):
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+        )
+        return response.choices[0].message.content
+
+    def __get_invoices(self, invoice_ID):
+        invoice_metadata = self.db_connector.retrieve_data("invoices", condition=f"WHERE `invoice_ID` == {invoice_ID}")[0]
+        if invoice_metadata["requires_OCR"]:
+            if invoice_metadata["OCR_status"]:
+               return json.loads(self.db_connector.retrieve_data("OCR_results"))
+
+            try:
+                with open(invoice_metadata["file_path"], "rb") as image:
+                    encoded_image = base64.b64encode(image.read())
+            except FileNotFoundError:
+                raise RuntimeError(f"File {invoice_metadata['file_path']} not found.")
+
+            messages = [{"role":"system","content":""""""},
+                        {"role":"user","content":{"type":"base64", "base64":encoded_image}}]
+
+            OCR_result = json.loads(self.__prompt(self.OCR_model, messages))
+            self.db_connector.update_data("invoices", "OCR_status", True)
+            self.db_connector.insert_data("OCR_results", ["invoice_ID", "OCR_result"], [invoice_ID, OCR_result])
+
+            return {"OCR":True, "OCR_result":OCR_result}
+
+        return {"OCR":False, "file_path":invoice_metadata["file_path"], "file_type":invoice_metadata["file_type"]}
+
+    def validate_transaction(self, invoice_ID):
+        invoice = self.__get_invoices(invoice_ID)
+        messages = [{"role":"system","content":""""""}]
+        if invoice["OCR"]:
+            messages.append({"role":"user", "content": invoice["OCR_results"]})
+        else:
+            if invoice["file_type"] == "pdf":
+                content = self.process_pdf(invoice["file_path"])
+            elif invoice["file_type"] == "docx":
+                content = None
+
+            messages.append({"role":"user", "content": content})
 
 
 
