@@ -361,18 +361,15 @@ class Agent():
         if not matching_result or not matching_result.get("Matching_Candidates"):
             print("AI could not find any matching candidates among the retrieved transactions.")
             return None
-        print("checkpoint1")
         invoice_currency = matching_result.get("Invoice_Currency")
         matching_candidates = matching_result.get("Matching_Candidates")
 
         valid_transaction_ids = {ID for candidate in matching_candidates for ID in candidate}
-        print("checkpoint2")
         # 1. Filter the list down to only the valid transactions (kept for later use)
         filtered_transactions = [
             txn for txn in filtered_transactions
             if txn["transaction_id"] in valid_transaction_ids
         ]
-        print("checkpoint3")
         # 2. Iterate directly over the newly filtered list to build the payload
         search_request = []
         for txn in filtered_transactions:
@@ -383,7 +380,6 @@ class Agent():
                 "DateTime_of_Transaction": txn["transaction_datetime"].strftime("%Y-%m-%d %H:%M:%S")
             }
             search_request.append(payload)
-        print("search request",search_request)
         transaction_losses = self.__search_transaction_losses(invoice_currency, search_request)
         print("Debugging", transaction_losses)
 
