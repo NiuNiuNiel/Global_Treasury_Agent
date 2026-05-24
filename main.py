@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import messagebox, filedialog
 import threading
 import os
+import re
 from datetime import datetime
 
 # Try to import backend modules; fall back gracefully if unavailable
@@ -25,7 +26,7 @@ except ImportError:
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-CONFIDENCE_THRESHOLD = 0.95  # >= 95% => auto-validated
+CONFIDENCE_THRESHOLD = 0.95  # >= 95% => auto-validated (0-1 scale, matching DB storage)
 
 C = {
     "bg":         "#0e0e1a",
@@ -63,7 +64,7 @@ COLUMNS = [
     ("actions",     "Actions",      145,   "center"),
 ]
 
-# Supported upload extensions -> (file_type stored in DB, requires_OCR)
+# Supported upload extensions -> (file_type stored in DB, requires_ocr)
 UPLOAD_EXT_MAP = {
     "pdf":  ("pdf",  False),
     "docx": ("docx", False),
@@ -105,6 +106,16 @@ MOCK_INVOICES = [
     },
 ]
 
+# Pre-seeded mock API templates used when auto-generating an endpoint for a new bank
+_MOCK_API_TEMPLATE = "https://api.{slug}.morpheus.io/v1/transactions"
+
+
+def _make_slug(name: str) -> str:
+    """Turn a bank display name into a URL-safe slug."""
+    slug = name.lower().strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    return slug.strip("-")
+
 
 # =============================================================================
 #  HELPER WIDGETS
@@ -141,6 +152,262 @@ class StatCard(ctk.CTkFrame):
 
     def set_value(self, value):
         self.value_label.configure(text=value)
+
+
+# =============================================================================
+#  BANK MANAGER DIALOG
+# =============================================================================
+
+class BankManagerDialog(ctk.CTkToplevel):
+    """Modal dialog for registering / removing banks."""
+
+    _BANK_COL_WIDTHS = (220, 370, 70)   # name | api | action
+
+    def __init__(self, master, db, db_rollback_fn, **kwargs):
+        super().__init__(master, **kwargs)
+        self.title("Registered Banks")
+        self.geometry("700x540")
+        self.resizable(False, False)
+        self.configure(fg_color=C["bg"])
+
+        self._db           = db
+        self._db_rollback  = db_rollback_fn
+        self._bank_rows    = []   # list of frame widgets currently rendered
+
+        self._build_ui()
+        self._load_banks()
+
+        # Block interaction with the main window until this is closed
+        self.grab_set()
+        self.focus_set()
+        self.lift()
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.rowconfigure(0, weight=0)  # header
+        self.rowconfigure(1, weight=0)  # column labels
+        self.rowconfigure(2, weight=1)  # scrollable list
+        self.rowconfigure(3, weight=0)  # separator
+        self.rowconfigure(4, weight=0)  # add-bank form
+        self.columnconfigure(0, weight=1)
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hf = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=0, height=58)
+        hf.grid(row=0, column=0, sticky="ew")
+        hf.grid_propagate(False)
+        ctk.CTkLabel(hf, text="  Registered Banks",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=C["text"]).pack(side="left", padx=20, pady=14)
+        ctk.CTkLabel(hf,
+                     text="Banks listed here are eligible for AI transaction matching.",
+                     font=ctk.CTkFont(size=11), text_color=C["text_dim"]
+                     ).pack(side="left", padx=0, pady=14)
+
+        # ── Column header bar ─────────────────────────────────────────────────
+        ch = ctk.CTkFrame(self, fg_color=C["card"], corner_radius=0, height=32)
+        ch.grid(row=1, column=0, sticky="ew")
+        ch.grid_propagate(False)
+        for col, (label, width) in enumerate(zip(
+                ["Bank Name", "API Endpoint", ""],
+                self._BANK_COL_WIDTHS)):
+            ch.columnconfigure(col, minsize=width, weight=(1 if col == 1 else 0))
+            ctk.CTkLabel(ch, text=label,
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=C["text_dim"], anchor="w"
+                         ).grid(row=0, column=col, padx=(14 if col == 0 else 8),
+                                pady=4, sticky="ew")
+
+        # ── Scrollable bank list ───────────────────────────────────────────────
+        self._scroll = ctk.CTkScrollableFrame(
+            self, fg_color=C["bg"], corner_radius=0,
+            scrollbar_button_color=C["border"],
+            scrollbar_button_hover_color=C["accent"])
+        self._scroll.grid(row=2, column=0, sticky="nsew")
+        self._scroll.columnconfigure(0, weight=1)
+
+        # ── Separator ─────────────────────────────────────────────────────────
+        Separator(self).grid(row=3, column=0, sticky="ew", pady=(4, 0))
+
+        # ── Add-bank form ─────────────────────────────────────────────────────
+        form = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=0)
+        form.grid(row=4, column=0, sticky="ew", padx=0, pady=0)
+        form.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(form, text="Add Bank", font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=C["text"]).grid(row=0, column=0, columnspan=4,
+                                                padx=16, pady=(14, 6), sticky="w")
+
+        # Bank name
+        ctk.CTkLabel(form, text="Name", font=ctk.CTkFont(size=12),
+                     text_color=C["text_dim"]).grid(row=1, column=0, padx=(16, 6),
+                                                    pady=(0, 14), sticky="w")
+        self._name_entry = ctk.CTkEntry(form, placeholder_text="e.g. Maybank",
+                                        width=180, height=32,
+                                        font=ctk.CTkFont(size=12),
+                                        fg_color=C["card"], border_color=C["border"])
+        self._name_entry.grid(row=1, column=1, padx=(0, 10), pady=(0, 14), sticky="w")
+        self._name_entry.bind("<KeyRelease>", self._on_name_change)
+
+        # API endpoint
+        ctk.CTkLabel(form, text="API", font=ctk.CTkFont(size=12),
+                     text_color=C["text_dim"]).grid(row=1, column=2, padx=(0, 6),
+                                                    pady=(0, 14), sticky="w")
+        api_frame = ctk.CTkFrame(form, fg_color="transparent")
+        api_frame.grid(row=1, column=3, padx=(0, 16), pady=(0, 14), sticky="ew")
+        form.columnconfigure(3, weight=1)
+
+        self._api_entry = ctk.CTkEntry(api_frame,
+                                       placeholder_text="https://api.yourbank.com/v1/...",
+                                       height=32, font=ctk.CTkFont(size=12),
+                                       fg_color=C["card"], border_color=C["border"])
+        self._api_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        ctk.CTkButton(api_frame, text="Generate",
+                      width=80, height=32, font=ctk.CTkFont(size=11),
+                      fg_color=C["card"], hover_color=C["border"],
+                      border_width=1, border_color=C["border"],
+                      command=self._generate_api).pack(side="left")
+
+        ctk.CTkButton(api_frame, text="+ Add",
+                      width=72, height=32, font=ctk.CTkFont(size=12),
+                      fg_color=C["accent"], hover_color=C["accent_dim"],
+                      command=self._add_bank).pack(side="left", padx=(8, 0))
+
+    # ── Data ──────────────────────────────────────────────────────────────────
+
+    def _load_banks(self):
+        """Fetch banks from DB and re-render the list."""
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._bank_rows = []
+
+        if not self._db:
+            ctk.CTkLabel(self._scroll,
+                         text="No database connection.",
+                         font=ctk.CTkFont(size=13), text_color=C["text_muted"]
+                         ).pack(pady=30)
+            return
+
+        try:
+            banks = self._db.retrieve_data("registered_banks")
+        except Exception:
+            self._db_rollback()
+            banks = []
+
+        if not banks:
+            ctk.CTkLabel(self._scroll,
+                         text="No banks registered yet. Add one below.",
+                         font=ctk.CTkFont(size=13), text_color=C["text_muted"]
+                         ).pack(pady=30)
+            return
+
+        for idx, bank in enumerate(banks):
+            bg = C["row_even"] if idx % 2 == 0 else C["row_odd"]
+            row_frame = ctk.CTkFrame(self._scroll, fg_color=bg, corner_radius=0)
+            row_frame.pack(fill="x", pady=0)
+
+            for col, width in enumerate(self._BANK_COL_WIDTHS):
+                row_frame.columnconfigure(col, minsize=width,
+                                          weight=(1 if col == 1 else 0))
+
+            name = bank.get("bank_name", "")
+            api  = bank.get("mock_api", "") or ""
+
+            ctk.CTkLabel(row_frame, text=name,
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color=C["accent"], anchor="w"
+                         ).grid(row=0, column=0, padx=(14, 8), pady=10, sticky="ew")
+
+            # Truncate long URLs for display
+            display_api = api if len(api) <= 52 else api[:49] + "..."
+            ctk.CTkLabel(row_frame, text=display_api,
+                         font=ctk.CTkFont(size=11, family="Courier"),
+                         text_color=C["text_dim"], anchor="w"
+                         ).grid(row=0, column=1, padx=(0, 8), pady=10, sticky="ew")
+
+            ctk.CTkButton(row_frame, text="Remove",
+                          width=64, height=26, font=ctk.CTkFont(size=11),
+                          fg_color="#3a1010", hover_color="#5a1a1a",
+                          text_color="#e74c3c",
+                          border_width=1, border_color="#e74c3c",
+                          command=lambda n=name: self._delete_bank(n)
+                          ).grid(row=0, column=2, padx=(0, 10), pady=8)
+
+            self._bank_rows.append(row_frame)
+
+    def _add_bank(self):
+        name = self._name_entry.get().strip()
+        api  = self._api_entry.get().strip()
+
+        if not name:
+            messagebox.showwarning("Missing Name",
+                                   "Please enter a bank name.", parent=self)
+            return
+        if not api:
+            # Auto-generate if user didn't fill it in
+            api = _MOCK_API_TEMPLATE.format(slug=_make_slug(name))
+
+        if not self._db:
+            messagebox.showerror("No Database",
+                                 "Not connected to the database.", parent=self)
+            return
+
+        try:
+            self._db.insert_data(
+                "registered_banks",
+                ["bank_name", "mock_api"],
+                [name, api]
+            )
+        except Exception as e:
+            self._db_rollback()
+            err = str(e)
+            if "unique" in err.lower() or "duplicate" in err.lower():
+                messagebox.showerror("Duplicate",
+                                     '"{}" is already registered.'.format(name),
+                                     parent=self)
+            else:
+                messagebox.showerror("DB Error", str(e), parent=self)
+            return
+
+        self._name_entry.delete(0, "end")
+        self._api_entry.delete(0, "end")
+        self._load_banks()
+
+    def _delete_bank(self, bank_name):
+        if not messagebox.askyesno(
+                "Confirm Removal",
+                'Remove "{}" from registered banks?\n\n'
+                'Future AI validations will no longer search this bank.'.format(bank_name),
+                parent=self):
+            return
+
+        try:
+            # Data_Retrieval has no delete_data method, so we use the raw cursor directly.
+            self._db.cursor.execute(
+                'DELETE FROM registered_banks WHERE bank_name = %s',
+                (bank_name,)
+            )
+            self._db.conn.commit()
+        except Exception as e:
+            self._db_rollback()
+            messagebox.showerror("DB Error", str(e), parent=self)
+            return
+
+        self._load_banks()
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _on_name_change(self, _event=None):
+        """Keep the Generate button preview in sync as the user types."""
+        pass  # generate is on-demand via button click
+
+    def _generate_api(self):
+        name = self._name_entry.get().strip()
+        slug = _make_slug(name) if name else "yourbank"
+        api  = _MOCK_API_TEMPLATE.format(slug=slug)
+        self._api_entry.delete(0, "end")
+        self._api_entry.insert(0, api)
 
 
 # =============================================================================
@@ -327,6 +594,7 @@ class GlobalTreasuryApp(ctk.CTk):
         self._active_threads = {}
         self._filter_var     = None
         self._search_entry   = None
+        self._bank_dialog    = None   # keep reference to avoid GC
 
         self._build_ui()
         self._connect_backend()
@@ -437,6 +705,13 @@ class GlobalTreasuryApp(ctk.CTk):
                       border_width=1, border_color="#2ecc71",
                       command=self._upload_invoices).pack(side="left", padx=(0, 8))
 
+        # ── Bank Manager button ───────────────────────────────────────────────
+        ctk.CTkButton(btn_frame, text="🏦 Banks",
+                      width=90, height=32, font=ctk.CTkFont(size=12),
+                      fg_color=C["card"], hover_color=C["border"],
+                      border_width=1, border_color=C["border"],
+                      command=self._open_bank_manager).pack(side="left", padx=(0, 8))
+
         ctk.CTkButton(btn_frame, text="Refresh",
                       width=100, height=32, font=ctk.CTkFont(size=12),
                       fg_color=C["card"], hover_color=C["border"],
@@ -535,16 +810,24 @@ class GlobalTreasuryApp(ctk.CTk):
                 except Exception:
                     self._db_rollback()
 
-                # Build validation_details lookup: db_id -> {confidence, transaction_id}
-                val_lookup = {}
+                # confidence lookup: db_id -> confidence_score (0-1 float)
+                conf_lookup = {}
                 try:
                     for val_row in self._db.retrieve_data("validation_details"):
                         did = val_row.get("invoice_id")
                         if did is not None:
-                            val_lookup[int(did)] = {
-                                "confidence":     float(val_row.get("confidence_score", 0)),
-                                "transaction_id": val_row.get("transaction_id"),
-                            }
+                            conf_lookup[int(did)] = float(val_row.get("confidence_score", 0))
+                except Exception:
+                    self._db_rollback()
+
+                # matched transaction IDs: db_id -> [transaction_id, ...]
+                txn_lookup = {}
+                try:
+                    for vt_row in self._db.retrieve_data("validation_transactions"):
+                        did = vt_row.get("invoice_id")
+                        tid = vt_row.get("transaction_id")
+                        if did is not None and tid is not None:
+                            txn_lookup.setdefault(int(did), []).append(str(tid))
                 except Exception:
                     self._db_rollback()
 
@@ -552,14 +835,12 @@ class GlobalTreasuryApp(ctk.CTk):
                 for r in raw:
                     db_id = int(r.get("invoice_id") or r.get("invoice_ID", 0))
                     ocr   = ocr_lookup.get(db_id, {})
-                    val   = val_lookup.get(db_id, {})
 
-                    # validation_status is BOOLEAN in DB:
-                    #   TRUE  = validated (auto or manual, distinguished by confidence)
-                    #   FALSE = not yet validated (pending)
-                    validated = bool(r.get("validation_status", False))
+                    validated  = bool(r.get("validation_status", False))
+                    confidence = conf_lookup.get(db_id)
+                    matched    = txn_lookup.get(db_id, [])
+
                     if validated:
-                        confidence = val.get("confidence")
                         if confidence is not None and confidence >= CONFIDENCE_THRESHOLD:
                             ui_status = "auto_validated"
                         else:
@@ -567,11 +848,6 @@ class GlobalTreasuryApp(ctk.CTk):
                     else:
                         ui_status  = "pending"
                         confidence = None
-
-                    matched = []
-                    txn_id  = val.get("transaction_id")
-                    if txn_id:
-                        matched = [txn_id]
 
                     self._invoices.append({
                         "invoice_id":        "INV-{:04d}".format(db_id),
@@ -697,7 +973,7 @@ class GlobalTreasuryApp(ctk.CTk):
                 self._db.insert_data(
                     "invoices",
                     ["file_name", "file_path", "file_type", "requires_ocr", "validation_status"],
-                    [filename, path, file_type, requires_ocr, False]  # FALSE (bool) = pending
+                    [filename, path, file_type, requires_ocr, False]
                 )
                 uploaded.append(filename)
             except Exception as e:
@@ -721,6 +997,22 @@ class GlobalTreasuryApp(ctk.CTk):
         else:
             messagebox.showwarning("Nothing Uploaded",
                                    "\n\n".join(lines) or "No files uploaded.")
+
+    # =========================================================================
+    #  BANK MANAGER
+    # =========================================================================
+
+    def _open_bank_manager(self):
+        if not self._db:
+            messagebox.showwarning("No Database",
+                                   "Cannot manage banks: not connected to the database.")
+            return
+        # Reuse existing window if still open
+        if self._bank_dialog and self._bank_dialog.winfo_exists():
+            self._bank_dialog.lift()
+            self._bank_dialog.focus_set()
+            return
+        self._bank_dialog = BankManagerDialog(self, self._db, self._db_rollback)
 
     # =========================================================================
     #  AI VALIDATION
@@ -748,45 +1040,70 @@ class GlobalTreasuryApp(ctk.CTk):
 
     def _validation_worker(self, db_id, row):
         result = {"status": "error", "confidence": None,
-                  "matched_ids": [], "message": "Agent not available"}
+                  "matched_ids": [], "message": "Agent not available",
+                  "_agent_wrote_db": False}
 
         if self._agent:
             try:
                 raw = self._agent.validate_transaction(db_id)
+
                 if raw is None:
                     result = {"status": "error", "confidence": None,
-                              "matched_ids": [], "message": "Agent returned None (WIP)"}
-                elif isinstance(raw, dict):
-                    result = raw
+                              "matched_ids": [], "message": "Agent returned None — check logs",
+                              "_agent_wrote_db": False}
+
+                elif isinstance(raw, dict) and "validated" in raw:
+                    conf = raw.get("confidence")
+                    txns = raw.get("transactions") or []
+                    if raw["validated"]:
+                        result = {
+                            "status":          "auto_validated",
+                            "confidence":      conf,
+                            "matched_ids":     txns,
+                            "_agent_wrote_db": True,
+                            "message":         "",
+                        }
+                    else:
+                        result = {
+                            "status":          "needs_manual",
+                            "confidence":      conf,
+                            "matched_ids":     txns,
+                            "_agent_wrote_db": False,
+                            "message":         "",
+                        }
                 else:
                     result = {"status": "error", "confidence": None,
-                              "matched_ids": [], "message": str(raw)}
+                              "matched_ids": [], "message": str(raw),
+                              "_agent_wrote_db": False}
+
             except Exception as e:
                 result = {"status": "error", "confidence": None,
-                          "matched_ids": [], "message": str(e)}
+                          "matched_ids": [], "message": str(e),
+                          "_agent_wrote_db": False}
         else:
-            # Simulation mode — remove once real agent is connected
+            # ── Simulation mode ── remove once real agent is connected ──────
             import time, random
             time.sleep(2.5)
             confidence = round(random.uniform(0.72, 0.99), 4)
             status = "auto_validated" if confidence >= CONFIDENCE_THRESHOLD else "needs_manual"
             result = {
-                "status":      status,
-                "confidence":  confidence,
-                "matched_ids": ["TXN-{}".format(random.randint(100000, 999999))],
-                "message":     "Simulated (agent not connected)",
+                "status":          status,
+                "confidence":      confidence,
+                "matched_ids":     ["TXN-{}".format(random.randint(100000, 999999))],
+                "_agent_wrote_db": False,
+                "message":         "Simulated (agent not connected)",
             }
 
         self.after(0, self._on_validation_done, db_id, row, result)
 
     def _on_validation_done(self, db_id, row, result):
-        status     = result.get("status", "error")
-        confidence = result.get("confidence")
+        status      = result.get("status", "error")
+        confidence  = result.get("confidence")
         matched_ids = result.get("matched_ids") or []
+        agent_wrote = result.get("_agent_wrote_db", False)
 
         row.set_result(status, confidence, matched_ids, result.get("message", ""))
 
-        # Update in-memory invoice
         for inv in self._invoices:
             if inv.get("_db_id") == db_id:
                 inv["validation_status"] = status
@@ -794,20 +1111,26 @@ class GlobalTreasuryApp(ctk.CTk):
                 inv["_matched_ids"]      = matched_ids
                 break
 
-        # Only auto_validated writes TRUE to DB immediately.
-        # needs_manual stays FALSE until the user clicks Approve.
-        if self._db and status == "auto_validated" and confidence is not None:
+        if self._db and status == "auto_validated" and confidence is not None and not agent_wrote:
             try:
                 self._db.update_data(
                     "invoices", ["validation_status"], [True],
                     "invoice_id = %s", (db_id,)
                 )
-                txn_id = matched_ids[0] if matched_ids else None
                 self._db.insert_data(
                     "validation_details",
-                    ["invoice_id", "confidence_score", "transaction_id"],
-                    [db_id, confidence, txn_id]
+                    ["invoice_id", "confidence_score"],
+                    [db_id, confidence]
                 )
+                for txn_id in matched_ids:
+                    try:
+                        self._db.insert_data(
+                            "validation_transactions",
+                            ["invoice_id", "transaction_id"],
+                            [db_id, txn_id]
+                        )
+                    except Exception:
+                        self._db_rollback()
             except Exception as e:
                 self._db_rollback()
                 print("[DB] Failed to persist auto_validated for {}: {}".format(db_id, e))
@@ -820,9 +1143,9 @@ class GlobalTreasuryApp(ctk.CTk):
     # =========================================================================
 
     def _approve_row(self, row):
-        display_id = row.invoice["invoice_id"]
-        db_id      = row.invoice.get("_db_id", display_id)
-        confidence = row.invoice.get("_confidence") or 0.0
+        display_id  = row.invoice["invoice_id"]
+        db_id       = row.invoice.get("_db_id", display_id)
+        confidence  = row.invoice.get("_confidence") or 0.0
         matched_ids = row.invoice.get("_matched_ids") or []
 
         if not messagebox.askyesno("Confirm Approval",
@@ -838,17 +1161,24 @@ class GlobalTreasuryApp(ctk.CTk):
 
         if self._db:
             try:
-                # Write boolean TRUE (not the string "manually_validated")
                 self._db.update_data(
                     "invoices", ["validation_status"], [True],
                     "invoice_id = %s", (db_id,)
                 )
-                txn_id = matched_ids[0] if matched_ids else None
                 self._db.insert_data(
                     "validation_details",
-                    ["invoice_id", "confidence_score", "transaction_id"],
-                    [db_id, confidence, txn_id]
+                    ["invoice_id", "confidence_score"],
+                    [db_id, confidence]
                 )
+                for txn_id in matched_ids:
+                    try:
+                        self._db.insert_data(
+                            "validation_transactions",
+                            ["invoice_id", "transaction_id"],
+                            [db_id, txn_id]
+                        )
+                    except Exception:
+                        self._db_rollback()
             except Exception as e:
                 self._db_rollback()
                 messagebox.showerror("DB Error", "Could not update database:\n{}".format(e))

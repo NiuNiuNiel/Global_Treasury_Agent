@@ -3,15 +3,30 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import base64
 import json
+import datetime
+from decimal import Decimal
 import fitz
 from pdf2image import convert_from_path
 import pytesseract
 import docx
 
 
+class _DBEncoder(json.JSONEncoder):
+    """Handles types that psycopg2 / RealDictRow put into query results."""
+
+    def default(self, obj):
+        if isinstance(obj, datetime.datetime):
+            return obj.strftime("%Y-%m-%d %H:%M:%S")
+        if isinstance(obj, datetime.date):
+            return obj.isoformat()
+        if isinstance(obj, Decimal):
+            return float(obj)
+        return super().default(obj)
+
 
 class Agent():
-    def __init__(self, db_connector, searching_model = "deepseek-v3.2:web", OCR_model = "kimi-k2.6", fast_model = "glm-4.7-flash", thinking_model = "deepseek-v4-pro"):
+    def __init__(self, db_connector, searching_model="deepseek-v3.2:web", OCR_model="kimi-k2.6",
+                 fast_model="glm-4.7-flash", thinking_model="deepseek-v4-pro"):
         load_dotenv()
         self.client = OpenAI(api_key=os.getenv("MORPHEUS_API_KEY"), base_url=os.getenv("MORPHEUS_BASE_URL"))
         self.searching_model = searching_model
@@ -96,10 +111,26 @@ class Agent():
         return response.choices[0].message.content
 
     def __get_invoices(self, invoice_ID):
-        invoice_metadata = self.db_connector.retrieve_data("invoices", columns=["file_path", "file_type", "requires_OCR", "OCR_status"],condition="invoice_ID = %s", condition_values=(invoice_ID,))[0]
-        if invoice_metadata["requires_OCR"]:
-            if invoice_metadata["OCR_status"]:
-               return {"OCR": True, "OCR_result": self.db_connector.retrieve_data("OCR_results",["OCR_result"],"invoice_ID = %s",(invoice_ID,))[0]["OCR_result"]}
+        # FIX: column names must be lowercase — sql.Identifier double-quotes them,
+        # making them case-sensitive; PostgreSQL stores unquoted DDL names as lowercase.
+        invoice_metadata = self.db_connector.retrieve_data(
+            "invoices",
+            columns=["file_path", "file_type", "requires_ocr", "ocr_status"],
+            condition="invoice_ID = %s",
+            condition_values=(invoice_ID,)
+        )[0]
+
+        # FIX: RealDictCursor returns lowercase keys from the DB
+        if invoice_metadata["requires_ocr"]:
+            if invoice_metadata["ocr_status"]:
+                # FIX: table "ocr_results" and column "ocr_result" (lowercase)
+                return {
+                    "OCR": True,
+                    "OCR_result": self.db_connector.retrieve_data(
+                        "ocr_results", ["ocr_result"],
+                        "invoice_ID = %s", (invoice_ID,)
+                    )[0]["ocr_result"]
+                }
 
             try:
                 with open(invoice_metadata["file_path"], "rb") as image:
@@ -120,7 +151,7 @@ class Agent():
                     bank: string,
                     text_content: string
                 }
-                
+
                 Field description:
                 - confidence: A floating-point number between 0.00 and 1.00 indicating your extraction confidence accuracy. If you are highly uncertain of the text legibility, score it below 0.90.
                 - invoice_amount: The total final payable amount indicated on the invoice. Must be a clean floating-point number (e.g., 1250.50). Do not include currency symbols or thousands separators.
@@ -147,44 +178,48 @@ class Agent():
             OCR_result = self.__clean_json(self.__prompt(self.OCR_model, messages))
 
             if OCR_result["confidence"] < 0.90:
-                self.db_connector.update_data("invoices", ["OCR_status"], [False], "invoice_ID = %s",(invoice_ID,))
+                # FIX: lowercase column name "ocr_status"
+                self.db_connector.update_data("invoices", ["ocr_status"], [False], "invoice_ID = %s", (invoice_ID,))
                 return None
 
-            self.db_connector.update_data("invoices", ["OCR_status"], [True], "invoice_ID = %s",(invoice_ID,))
-            self.db_connector.insert_data("OCR_results", ["invoice_ID", "OCR_result"], [invoice_ID, json.dumps(OCR_result)])
+            # FIX: lowercase column name "ocr_status"
+            self.db_connector.update_data("invoices", ["ocr_status"], [True], "invoice_ID = %s", (invoice_ID,))
+            # FIX: table "ocr_results", columns ["invoice_id", "ocr_result"] (all lowercase)
+            self.db_connector.insert_data("ocr_results", ["invoice_id", "ocr_result"],
+                                          [invoice_ID, json.dumps(OCR_result)])
 
-            return {"OCR":True, "OCR_result":OCR_result}
+            return {"OCR": True, "OCR_result": OCR_result}
 
-        return {"OCR":False, "file_path":invoice_metadata["file_path"], "file_type":invoice_metadata["file_type"]}
+        return {"OCR": False, "file_path": invoice_metadata["file_path"], "file_type": invoice_metadata["file_type"]}
 
     def __filter_transactions(self, invoice):
         registered_banks = [bank["bank_name"] for bank in
                             self.db_connector.retrieve_data("registered_banks", ["bank_name"])]
 
         filter_system_prompt = (
-            """You are an AI treasury routing agent. Given invoice text data and a list of system-registered banks, 
-            your task is to isolate which bank or banks the transaction likely went through, and determine a realistic
-            search date window based on the invoice's date context.\n\n""" +
+                """You are an AI treasury routing agent. Given invoice text data and a list of system-registered banks, 
+                your task is to isolate which bank or banks the transaction likely went through, and determine a realistic
+                search date window based on the invoice's date context.\n\n""" +
 
-            f"Registered Banks in System: {registered_banks}\n\n" +
+                f"Registered Banks in System: {registered_banks}\n\n" +
 
-            """Instructions:
-            1. Identify all suitable 'Bank' options from the allowed list. Return them as a list of strings. If it does not match any registered bank, return false for that key, or null if there is no bank being mentioned.
-            2. Generate a 'Date_Window' suffix or clause suitable for a database filter (e.g., a specific start and end date).
-
-            Return strictly a raw JSON object conforming exactly to this layout:
-            {
-                "Bank": ["Maybank", "CIMB"],
-                "Date_Window": "2026-05-23 AND 2026-05-26"
-            }
-
-            Field descriptions:
-            - Bank: 
-                - A list of explicit bank names identified from the invoice payment instructions. Each item MUST be an exact string match to one of the options provided in the 'Registered Banks in System' list.
-                - If no bank is mentioned, return null.
-                - If the mentioned bank(s) are not on the registered list, return the boolean value false.
-            - Date_Window: A string representing a SQL-friendly date range for the database query, formatted strictly as 'YYYY-MM-DD AND YYYY-MM-DD'. The start date should be the invoice issue date. The end date should be the stated due date. If the invoice does not mention a due date or payment terms, calculate the end date by defaulting to exactly 30 days after the invoice issue date.
-            """
+                """Instructions:
+                1. Identify all suitable 'Bank' options from the allowed list. Return them as a list of strings. If it does not match any registered bank, return false for that key, or null if there is no bank being mentioned.
+                2. Generate a 'Date_Window' suffix or clause suitable for a database filter (e.g., a specific start and end date).
+    
+                Return strictly a raw JSON object conforming exactly to this layout:
+                {
+                    "Bank": ["Maybank", "CIMB"],
+                    "Date_Window": "2026-05-23 AND 2026-05-26"
+                }
+    
+                Field descriptions:
+                - Bank: 
+                    - A list of explicit bank names identified from the invoice payment instructions. Each item MUST be an exact string match to one of the options provided in the 'Registered Banks in System' list.
+                    - If no bank is mentioned, return null.
+                    - If the mentioned bank(s) are not on the registered list, return the boolean value false.
+                - Date_Window: A string representing a SQL-friendly date range for the database query, formatted strictly as 'YYYY-MM-DD AND YYYY-MM-DD'. The start date should be the invoice issue date. The end date should be the stated due date. If the invoice does not mention a due date or payment terms, calculate the end date by defaulting to exactly 30 days after the invoice issue date.
+                """
         )
 
         messages = [{"role": "system", "content": filter_system_prompt},
@@ -195,7 +230,7 @@ class Agent():
     def __find_matching_candidates(self, invoice, filtered_transactions):
         system_prompt = (
             """You are an expert AI financial reconciliation agent. Your task is to analyze an invoice and a list of potential bank transactions, and identify which transaction(s) likely represent the payment for the invoice.
-            
+
             INSTRUCTIONS & REASONING LOGIC:
             1. Analyze the invoice amount, date, and vendor details.
             2. Compare these against the provided list of bank transactions (amount, datetime, and description).
@@ -203,7 +238,7 @@ class Agent():
             4. Account for Variances: The bank transaction amount might NOT match the invoice amount exactly. This can happen due to cross-border currency exchange rates or deducted platform/gateway fees.
             5. Account for Split Payments: A single invoice may be paid across multiple separate bank transactions. If no single transaction is a clear match, evaluate if a combination of transactions made to the same vendor accurately sums up to the expected payment.
             6. If no transactions or combinations are plausible matches, return an empty list for the candidates.
-            
+
             CRITICAL REQUIREMENT:
             You must return your response strictly as a raw JSON object with no markdown formatting, preambles, or explanations.
             The output JSON schema must match this layout exactly:
@@ -212,15 +247,18 @@ class Agent():
                 "Invoice_Currency": "USD",
                 "Matching_Candidates": [["TXN-987654321"], ["TXN-123456789", "TXN-112233445"]]
             }
-            
+
             FIELD DESCRIPTIONS:
             - Invoice_Amount: The total final payable amount indicated on the invoice. Must be a clean floating-point number (e.g., 1250.50). Do not include currency symbols or thousands separators.
             - Invoice_Currency: The standard 3-letter ISO currency code representing the currency the original invoice was billed in (e.g., 'USD', 'MYR').
             - Matching_Candidates: A list of lists containing string 'transaction_ID's. Each inner list represents ONE plausible payment scenario (which may consist of a single transaction, or multiple transactions combined to cover the invoice). If no transactions match, return an empty list []."""
         )
 
+        # RealDictRow objects contain datetime and Decimal values that standard
+        # json.dumps cannot handle — convert to plain dicts and use _DBEncoder.
+        txn_json = json.dumps([dict(r) for r in filtered_transactions], cls=_DBEncoder)
         messages = [{"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Invoice: {invoice}\n\nTransactions: {json.dumps(filtered_transactions)}"}]
+                    {"role": "user", "content": f"Invoice: {invoice}\n\nTransactions: {txn_json}"}]
 
         return self.__clean_json(self.__prompt(self.thinking_model, messages))
 
@@ -258,18 +296,19 @@ class Agent():
         )
 
         messages = [{"role": "system", "content": search_system_prompt},
-                    {"role": "user", "content": f"invoice: {invoice_currency}\n\nSearch request: {json.dumps(search_request)}"}]
+                    {"role": "user",
+                     "content": f"invoice: {invoice_currency}\n\nSearch request: {json.dumps(search_request)}"}]
 
         return self.__clean_json(self.__prompt(self.searching_model, messages))
 
     def validate_transaction(self, invoice_ID):
         invoice = self.__get_invoices(invoice_ID)
 
-        print("Debugging",invoice)
+        print("Debugging", invoice)
 
         if invoice is None:
             print("Detection result inaccurate, please provide a clearer image.")
-            return
+            return None
 
         if invoice["OCR"]:
             invoice = json.dumps(invoice["OCR_result"])
@@ -282,12 +321,12 @@ class Agent():
                 raise TypeError(f"Unsupported file type: {invoice['file_type']}")
 
         filter_condition = self.__filter_transactions(invoice)
-        print("Debugging",filter_condition)
+        print("Debugging", filter_condition)
 
         bank_filter = filter_condition.get("Bank")
         if bank_filter is False:
             print("Bank given by the filter model has not been registered.")
-            return
+            return None
         elif not bank_filter:  # This safely catches None AND []
             bank_filter = [dic.get("bank_name") for dic in
                            self.db_connector.retrieve_data("registered_banks", ["bank_name"])]
@@ -298,7 +337,7 @@ class Agent():
             start_date, end_date = [date.strip() for date in filter_condition["Date_Window"].split("AND")]
         except ValueError:
             print("Error parsing Date_Window from model. Fallback needed.")
-            return
+            return None
 
         end_timestamp = f"{end_date} 23:59:59"
 
@@ -313,38 +352,38 @@ class Agent():
 
         if not filtered_transactions:
             print("No transactions found in the database for this search window.")
-            return
+            return None
 
         matching_result = self.__find_matching_candidates(invoice, filtered_transactions)
 
-        print("Debugging",matching_result)
+        print("Debugging", matching_result)
 
         if not matching_result or not matching_result.get("Matching_Candidates"):
             print("AI could not find any matching candidates among the retrieved transactions.")
-            return
-
+            return None
+        print("checkpoint1")
         invoice_currency = matching_result.get("Invoice_Currency")
         matching_candidates = matching_result.get("Matching_Candidates")
 
         valid_transaction_ids = {ID for candidate in matching_candidates for ID in candidate}
-
+        print("checkpoint2")
         # 1. Filter the list down to only the valid transactions (kept for later use)
         filtered_transactions = [
             txn for txn in filtered_transactions
-            if txn["transaction_ID"] in valid_transaction_ids
+            if txn["transaction_id"] in valid_transaction_ids
         ]
-
+        print("checkpoint3")
         # 2. Iterate directly over the newly filtered list to build the payload
         search_request = []
         for txn in filtered_transactions:
             payload = {
-                "Transaction_ID": txn["transaction_ID"],
+                "Transaction_ID": txn["transaction_id"],
                 "Bank": txn["bank_name"],
                 "Transaction_Currency": txn["currency"],
                 "DateTime_of_Transaction": txn["transaction_datetime"].strftime("%Y-%m-%d %H:%M:%S")
             }
             search_request.append(payload)
-
+        print("search request",search_request)
         transaction_losses = self.__search_transaction_losses(invoice_currency, search_request)
         print("Debugging", transaction_losses)
 
@@ -352,11 +391,11 @@ class Agent():
 
         if not invoice_amount:
             print("Error: Could not determine the original invoice amount for calculation.")
-            return
+            return None
 
         # 2. Convert lists to dictionaries for O(1) instant data lookups
         loss_lookup = {loss["Transaction_ID"]: loss for loss in transaction_losses}
-        txn_lookup = {txn["transaction_ID"]: txn for txn in filtered_transactions}
+        txn_lookup = {txn["transaction_id"]: txn for txn in filtered_transactions}
 
         best_scenario = None
         highest_confidence = 0.0
@@ -403,7 +442,11 @@ class Agent():
         print(f"--> Generated Highest Confidence: {highest_confidence:.2f}% for scenario: {best_scenario}")
 
         # 4. Satisfy Validation Confident Threshold
-        CONFIDENCE_THRESHOLD = 95.0  # You can adjust this threshold
+        CONFIDENCE_THRESHOLD = 95.0
+
+        # FIX: normalise confidence to 0-1 scale before storing and returning.
+        # Agent calculates confidence on a 0-100 scale; main.py and the DB use 0-1.
+        confidence_normalised = highest_confidence / 100.0
 
         if highest_confidence >= CONFIDENCE_THRESHOLD:
             print("--> [SUCCESS] Threshold met. Validating payment in database...")
@@ -411,16 +454,36 @@ class Agent():
             # Update the main invoice table
             self.db_connector.update_data("invoices", ["validation_status"], [True], "invoice_ID = %s", (invoice_ID,))
 
-            # Insert into the 1-to-1 validation metadata table
-            self.db_connector.insert_data("validation_details", ["invoice_ID", "confidence_score"],
-                                          [invoice_ID, highest_confidence])
+            # FIX: column "invoice_id" (lowercase); store normalised 0-1 confidence
+            self.db_connector.insert_data(
+                "validation_details",
+                ["invoice_id", "confidence_score"],
+                [invoice_ID, confidence_normalised]
+            )
 
             # Insert into the mapping table (handles split payments natively!)
+            # FIX: table "validation_transactions", columns lowercase
             for txn_id in best_scenario:
-                self.db_connector.insert_data("validation_transactions", ["invoice_ID", "transaction_ID"],
-                                              [invoice_ID, txn_id])
-            return True
+                self.db_connector.insert_data(
+                    "validation_transactions",
+                    ["invoice_id", "transaction_id"],
+                    [invoice_ID, txn_id]
+                )
+
+            # FIX: return a dict so main.py can parse the result uniformly.
+            # The agent has already written everything to the DB.
+            return {
+                "validated": True,
+                "confidence": confidence_normalised,
+                "transactions": best_scenario,
+            }
 
         print("--> [ALERT] Confidence below threshold. Flagged for Manual Validation.")
-        return best_scenario
 
+        # FIX: return a dict (not a bare list) so main.py can parse uniformly.
+        # DB is NOT updated here — main.py writes when the user clicks Approve.
+        return {
+            "validated": False,
+            "confidence": confidence_normalised,
+            "transactions": best_scenario,
+        }
