@@ -20,6 +20,11 @@ class Agent():
         self.thinking_model = thinking_model
         self.db_connector = db_connector
 
+    def __clean_json(self, raw_string):
+        # Strips markdown wrappers just in case the LLM disobeys the prompt
+        cleaned = raw_string.replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned)
+
     def __pdf_extraction(self, pdf_path, sample_pages=3):
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"The file {pdf_path} was not found.")
@@ -91,10 +96,10 @@ class Agent():
         return response.choices[0].message.content
 
     def __get_invoices(self, invoice_ID):
-        invoice_metadata = self.db_connector.retrieve_data("invoices", condition="`invoice_ID` = %s", condition_values=(invoice_ID,))[0]
+        invoice_metadata = self.db_connector.retrieve_data("invoices", condition="invoice_ID = %s", condition_values=(invoice_ID,))[0]
         if invoice_metadata["requires_OCR"]:
             if invoice_metadata["OCR_status"]:
-               return json.loads(self.db_connector.retrieve_data("OCR_results",["OCR_result"],"`invoice_ID` = %s",(invoice_ID,)))
+               return {"OCR": True, "OCR_result": self.db_connector.retrieve_data("OCR_results",["OCR_result"],"invoice_ID = %s",(invoice_ID,))[0]["OCR_result"]}
 
             try:
                 with open(invoice_metadata["file_path"], "rb") as image:
@@ -102,8 +107,8 @@ class Agent():
             except FileNotFoundError:
                 raise RuntimeError(f"File {invoice_metadata['file_path']} not found.")
 
-            ocr_system_prompt = (
-                """You are an expert financial OCR model. Analyze the provided invoice image and extract key details.
+            ocr_system_prompt = """
+                You are an expert financial OCR model. Analyze the provided invoice image and extract key details.
                 You must return your response strictly as a raw JSON object with no markdown formatting or wrappers.
                 The schema must match exactly:
                 {
@@ -125,7 +130,6 @@ class Agent():
                 - bank: The name of the receiving bank listed in the payment instructions section of the invoice if available (e.g., 'Maybank', 'CIMB'). If no specific bank is found, return null.
                 - text_content: A single flat text string containing the entire raw text layer extracted from the document for fallback matching purposes. Escaped line breaks are permitted.
                 """
-            )
 
             messages = [
                 {"role": "system", "content": ocr_system_prompt},
@@ -134,21 +138,20 @@ class Agent():
                     "content": [
                         {
                             "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}
+                            "image_url": {"url": f"data:image/jpeg;base64,{encoded_image.decode('utf-8')}"}
                         }
                     ]
                 }
             ]
 
-            OCR_result = json.loads(self.__prompt(self.OCR_model, messages))
+            OCR_result = self.__clean_json(self.__prompt(self.OCR_model, messages))
 
             if OCR_result["confidence"] < 0.90:
-                self.db_connector.update_data("invoices", ["OCR_status"], [False], "`invoice_ID` = %s",(invoice_ID,))
-                print("Detection result inaccurate, please upload a clearer picture.")
-                return
+                self.db_connector.update_data("invoices", ["OCR_status"], [False], "invoice_ID = %s",(invoice_ID,))
+                return None
 
-            self.db_connector.update_data("invoices", ["OCR_status"], [True], "`invoice_ID` = %s",(invoice_ID,))
-            self.db_connector.insert_data("OCR_results", ["invoice_ID", "OCR_result"], [invoice_ID, OCR_result])
+            self.db_connector.update_data("invoices", ["OCR_status"], [True], "invoice_ID = %s",(invoice_ID,))
+            self.db_connector.insert_data("OCR_results", ["invoice_ID", "OCR_result"], [invoice_ID, json.dumps(OCR_result)])
 
             return {"OCR":True, "OCR_result":OCR_result}
 
@@ -156,33 +159,130 @@ class Agent():
 
     def __filter_transactions(self, invoice):
         registered_banks = [bank["bank_name"] for bank in
-                            json.loads(self.db_connector.retrieve_data("registered_banks", ["bank_name"]))]
-        messages = [{"role":"system","content":""""""}]
-        if invoice["OCR"]:
-            messages.append({"role": "user", "content": invoice["OCR_result"]})
-        else:
-            if invoice["file_type"] == "pdf":
-                content = self.__pdf_extraction(invoice["file_path"])
-            elif invoice["file_type"] == "docx":
-                content = self.__word_doc_extraction(invoice["file_path"])
-            else:
-                raise TypeError(f"Unsupported file type: {invoice['file_type']}")
+                            self.db_connector.retrieve_data("registered_banks", ["bank_name"])]
 
-            messages.append({"role": "user", "content": content})
+        filter_system_prompt = (
+            """You are an AI treasury routing agent. Given invoice text data and a list of system-registered banks, 
+            your task is to isolate which bank or banks the transaction likely went through, and determine a realistic
+            search date window based on the invoice's date context.\n\n""" +
 
-        return json.loads(self.__prompt(self.fast_model, messages))
+            f"Registered Banks in System: {registered_banks}\n\n" +
+
+            """Instructions:
+            1. Identify all suitable 'Bank' options from the allowed list. Return them as a list of strings. If it does not match any registered bank, return false for that key, or null if there is no bank being mentioned.
+            2. Generate a 'Date_Window' suffix or clause suitable for a database filter (e.g., a specific start and end date).
+
+            Return strictly a raw JSON object conforming exactly to this layout:
+            {
+                "Bank": ["Maybank", "CIMB"],
+                "Date_Window": "2026-05-23 AND 2026-05-26"
+            }
+
+            Field descriptions:
+            - Bank: 
+                - A list of explicit bank names identified from the invoice payment instructions. Each item MUST be an exact string match to one of the options provided in the 'Registered Banks in System' list.
+                - If no bank is mentioned, return null.
+                - If the mentioned bank(s) are not on the registered list, return the boolean value false.
+            - Date_Window: A string representing a SQL-friendly date range for the database query, formatted strictly as 'YYYY-MM-DD AND YYYY-MM-DD'. The start date should be the invoice issue date. The end date should be the stated due date. If the invoice does not mention a due date or payment terms, calculate the end date by defaulting to exactly 30 days after the invoice issue date.
+            """
+        )
+
+        messages = [{"role": "system", "content": filter_system_prompt},
+                    {"role": "user", "content": invoice}]
+
+        return self.__clean_json(self.__prompt(self.fast_model, messages))
+
+    def __find_matching_candidates(self, invoice, filtered_transactions):
+        system_prompt = (
+            """You are an expert AI financial reconciliation agent. Your task is to analyze an invoice and a list of potential bank transactions, and identify which transaction(s) likely represent the payment for the invoice.
+            
+            INSTRUCTIONS & REASONING LOGIC:
+            1. Analyze the invoice amount, date, and vendor details.
+            2. Compare these against the provided list of bank transactions (amount, datetime, and description).
+            3. Account for Payment Delays: Bank transactions usually occur on or a few days after the invoice date.
+            4. Account for Variances: The bank transaction amount might NOT match the invoice amount exactly. This can happen due to cross-border currency exchange rates or deducted platform/gateway fees.
+            5. Account for Split Payments: A single invoice may be paid across multiple separate bank transactions. If no single transaction is a clear match, evaluate if a combination of transactions made to the same vendor accurately sums up to the expected payment.
+            6. If no transactions or combinations are plausible matches, return an empty list for the candidates.
+            
+            CRITICAL REQUIREMENT:
+            You must return your response strictly as a raw JSON object with no markdown formatting, preambles, or explanations.
+            The output JSON schema must match this layout exactly:
+            {
+              "Invoice_Currency": "USD",
+              "Matching_Candidates": [["TXN-987654321"], ["TXN-123456789", "TXN-112233445"]]
+            }
+            
+            FIELD DESCRIPTIONS:
+            - Invoice_Currency: The standard 3-letter ISO currency code representing the currency the original invoice was billed in (e.g., 'USD', 'MYR').
+            - Matching_Candidates: A list of lists containing string 'transaction_ID's. Each inner list represents ONE plausible payment scenario (which may consist of a single transaction, or multiple transactions combined to cover the invoice). If no transactions match, return an empty list []."""
+        )
+
+        messages = [{"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Invoice: {invoice}\n\nTransactions: {json.dumps(filtered_transactions)}"}]
+
+        return self.__clean_json(self.__prompt(self.thinking_model, messages))
+
+    def __search_transaction_losses(self, search_request):
+        pass
 
     def validate_transaction(self, invoice_ID):
         invoice = self.__get_invoices(invoice_ID)
-        filter = self.__filter_transactions(invoice)
 
-        if filter["bank"] is None:
-            filter["bank"] = self.db_connector.retrieve_data("registered_banks", ["bank_name"])
-        elif filter["bank"] is False:
-            print("Bank given by the filter model has not been registered.")
+        if invoice is None:
+            print("Detection result inaccurate, please provide a clearer image.")
             return
 
+        if invoice["OCR"]:
+            invoice = json.dumps(invoice["OCR_result"])
+        else:
+            if invoice["file_type"] == "pdf":
+                invoice = self.__pdf_extraction(invoice["file_path"])
+            elif invoice["file_type"] == "docx":
+                invoice = self.__word_doc_extraction(invoice["file_path"])
+            else:
+                raise TypeError(f"Unsupported file type: {invoice['file_type']}")
 
+        filter_condition = self.__filter_transactions(invoice)
+
+        bank_filter = filter_condition.get("Bank")
+        if bank_filter is False:
+            print("Bank given by the filter model has not been registered.")
+            return
+        elif not bank_filter:  # This safely catches None AND []
+            bank_filter = [dic.get("bank_name") for dic in
+                           self.db_connector.retrieve_data("registered_banks", ["bank_name"])]
+
+        target_banks = tuple(bank_filter)
+
+        try:
+            start_date, end_date = [date.strip() for date in filter_condition["Date_Window"].split("AND")]
+        except ValueError:
+            print("Error parsing Date_Window from model. Fallback needed.")
+            return
+
+        end_timestamp = f"{end_date} 23:59:59"
+
+        condition = "bank_name IN %s AND transaction_datetime BETWEEN %s AND %s"
+        condition_values = (target_banks, start_date, end_timestamp)
+
+        filtered_transactions = self.db_connector.retrieve_data(
+            table_name="transactions",
+            condition=condition,
+            condition_values=condition_values
+        )
+
+        if not filtered_transactions:
+            print("No transactions found in the database for this search window.")
+            return
+
+        matching_result = self.__find_matching_candidates(invoice, filtered_transactions)
+
+        if not matching_result or not matching_result.get("Matching_Candidates"):
+            print("AI could not find any matching candidates among the retrieved transactions.")
+            return
+
+        invoice_currency = matching_result.get("Invoice_Currency")
+        matching_candidates = matching_result.get("Matching_Candidates")
 
 
 
