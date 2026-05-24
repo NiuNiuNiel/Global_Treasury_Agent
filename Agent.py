@@ -96,7 +96,7 @@ class Agent():
         return response.choices[0].message.content
 
     def __get_invoices(self, invoice_ID):
-        invoice_metadata = self.db_connector.retrieve_data("invoices", condition="invoice_ID = %s", condition_values=(invoice_ID,))[0]
+        invoice_metadata = self.db_connector.retrieve_data("invoices", columns=["file_path", "file_type", "requires_OCR", "OCR_status"],condition="invoice_ID = %s", condition_values=(invoice_ID,))[0]
         if invoice_metadata["requires_OCR"]:
             if invoice_metadata["OCR_status"]:
                return {"OCR": True, "OCR_result": self.db_connector.retrieve_data("OCR_results",["OCR_result"],"invoice_ID = %s",(invoice_ID,))[0]["OCR_result"]}
@@ -208,11 +208,13 @@ class Agent():
             You must return your response strictly as a raw JSON object with no markdown formatting, preambles, or explanations.
             The output JSON schema must match this layout exactly:
             {
-              "Invoice_Currency": "USD",
-              "Matching_Candidates": [["TXN-987654321"], ["TXN-123456789", "TXN-112233445"]]
+                "Invoice_Amount": 1234.50,
+                "Invoice_Currency": "USD",
+                "Matching_Candidates": [["TXN-987654321"], ["TXN-123456789", "TXN-112233445"]]
             }
             
             FIELD DESCRIPTIONS:
+            - Invoice_Amount: The total final payable amount indicated on the invoice. Must be a clean floating-point number (e.g., 1250.50). Do not include currency symbols or thousands separators.
             - Invoice_Currency: The standard 3-letter ISO currency code representing the currency the original invoice was billed in (e.g., 'USD', 'MYR').
             - Matching_Candidates: A list of lists containing string 'transaction_ID's. Each inner list represents ONE plausible payment scenario (which may consist of a single transaction, or multiple transactions combined to cover the invoice). If no transactions match, return an empty list []."""
         )
@@ -300,7 +302,7 @@ class Agent():
 
         end_timestamp = f"{end_date} 23:59:59"
 
-        condition = "bank_name IN %s AND transaction_datetime BETWEEN %s AND %s"
+        condition = "bank_name IN %s AND transaction_datetime BETWEEN %s AND %s AND transaction_ID NOT IN (SELECT transaction_ID FROM validation_transactions WHERE transaction_ID IS NOT NULL)"
         condition_values = (target_banks, start_date, end_timestamp)
 
         filtered_transactions = self.db_connector.retrieve_data(
@@ -345,3 +347,80 @@ class Agent():
 
         transaction_losses = self.__search_transaction_losses(invoice_currency, search_request)
         print("Debugging", transaction_losses)
+
+        invoice_amount = matching_result.get("Invoice_Amount")
+
+        if not invoice_amount:
+            print("Error: Could not determine the original invoice amount for calculation.")
+            return
+
+        # 2. Convert lists to dictionaries for O(1) instant data lookups
+        loss_lookup = {loss["Transaction_ID"]: loss for loss in transaction_losses}
+        txn_lookup = {txn["transaction_ID"]: txn for txn in filtered_transactions}
+
+        best_scenario = None
+        highest_confidence = 0.0
+
+        # 3. Calculate Confidence Score
+        for scenario in matching_candidates:
+            scenario_actual_amount = 0.0
+            scenario_expected_amount = 0.0
+
+            for txn_id in scenario:
+                txn = txn_lookup.get(txn_id)
+                loss = loss_lookup.get(txn_id)
+
+                if not txn or not loss:
+                    continue
+
+                # Add up the actual transaction amounts from the database
+                scenario_actual_amount += float(txn["amount"])
+
+                # Extract loss parameters
+                exchange_rate = loss["Exchange_Rate"]
+                fixed_fee = loss["Fixed_Fee_Amount"]
+                percentage_rate = loss["Percentage_Fee_Rate"]
+
+                # Calculate exactly as your workflow diagram dictates
+                converted_gross = invoice_amount * exchange_rate
+                platform_fees = fixed_fee + (converted_gross * percentage_rate)
+                expected_amount = converted_gross - platform_fees
+
+                scenario_expected_amount += expected_amount
+
+            # Guard against division by zero
+            if scenario_actual_amount > 0:
+                confidence = (scenario_expected_amount / scenario_actual_amount) * 100
+
+                # Penalize variances in both directions (e.g., if confidence is 105%, it's functionally a 95% match)
+                if confidence > 100.0:
+                    confidence = 100.0 - (confidence - 100.0)
+
+                if confidence > highest_confidence:
+                    highest_confidence = confidence
+                    best_scenario = scenario
+
+        print(f"--> Generated Highest Confidence: {highest_confidence:.2f}% for scenario: {best_scenario}")
+
+        # 4. Satisfy Validation Confident Threshold
+        CONFIDENCE_THRESHOLD = 95.0  # You can adjust this threshold
+
+        if highest_confidence >= CONFIDENCE_THRESHOLD:
+            print("--> [SUCCESS] Threshold met. Validating payment in database...")
+
+            # Update the main invoice table
+            self.db_connector.update_data("invoices", ["validation_status"], [True], "invoice_ID = %s", (invoice_ID,))
+
+            # Insert into the 1-to-1 validation metadata table
+            self.db_connector.insert_data("validation_details", ["invoice_ID", "confidence_score"],
+                                          [invoice_ID, highest_confidence])
+
+            # Insert into the mapping table (handles split payments natively!)
+            for txn_id in best_scenario:
+                self.db_connector.insert_data("validation_transactions", ["invoice_ID", "transaction_ID"],
+                                              [invoice_ID, txn_id])
+            return True
+
+        print("--> [ALERT] Confidence below threshold. Flagged for Manual Validation.")
+        return False
+
