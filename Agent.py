@@ -107,8 +107,8 @@ class Agent():
             except FileNotFoundError:
                 raise RuntimeError(f"File {invoice_metadata['file_path']} not found.")
 
-            ocr_system_prompt = """
-                You are an expert financial OCR model. Analyze the provided invoice image and extract key details.
+            ocr_system_prompt = (
+                """You are an expert financial OCR model. Analyze the provided invoice image and extract key details.
                 You must return your response strictly as a raw JSON object with no markdown formatting or wrappers.
                 The schema must match exactly:
                 {
@@ -128,8 +128,8 @@ class Agent():
                 - vendor: The name of the merchant, company, or individual issuing the invoice (e.g., 'Example Corp').
                 - date: The date the invoice was issued, strictly formatted as an ISO 8601 string ('YYYY-MM-DD').
                 - bank: The name of the receiving bank listed in the payment instructions section of the invoice if available (e.g., 'Maybank', 'CIMB'). If no specific bank is found, return null.
-                - text_content: A single flat text string containing the entire raw text layer extracted from the document for fallback matching purposes. Escaped line breaks are permitted.
-                """
+                - text_content: A single flat text string containing the entire raw text layer extracted from the document for fallback matching purposes. Escaped line breaks are permitted."""
+            )
 
             messages = [
                 {"role": "system", "content": ocr_system_prompt},
@@ -222,11 +222,48 @@ class Agent():
 
         return self.__clean_json(self.__prompt(self.thinking_model, messages))
 
-    def __search_transaction_losses(self, search_request):
-        pass
+    def __search_transaction_losses(self, invoice_currency, search_request):
+        search_system_prompt = (
+            """You are an expert AI financial researcher and treasury analyst. 
+            Your task is to determine the historical exchange rates and standard fee deduction policies for a list of bank transactions.
+
+            You will be provided with the original 'invoice' currency and a 'Search request' containing a list of transaction details.
+
+            INSTRUCTIONS & REASONING LOGIC:
+            1. Exchange Rate: For each transaction, determine the exchange rate to convert from the original invoice currency to the 'Transaction_Currency' on the specific 'DateTime_of_Transaction'. 
+               - If the invoice currency and the transaction currency are identical, the exchange rate is exactly 1.0.
+               - If they differ, FIRST attempt to find the specific 'Bank's historical exchange rate (e.g., the Bank's Telegraphic Transfer (TT) Selling rate) for that exact date. 
+               - If the specific bank's exchange rate data for that date is unavailable, FALLBACK to the general/mid-market historical exchange rate for that date.
+            2. Fee Policy: Identify the standard corporate receiving/transfer fee policy for the specified 'Bank'. Break this policy down into a fixed fee and a percentage rate.
+
+            CRITICAL REQUIREMENT:
+            You must return your response strictly as a raw JSON array of objects, with NO markdown formatting, wrappers, or explanations.
+            The output MUST conform exactly to this schema:
+            [
+              {
+                "Transaction_ID": "string",
+                "Exchange_Rate": float,
+                "Fixed_Fee_Amount": float,
+                "Percentage_Fee_Rate": float
+              }
+            ]
+
+            FIELD DESCRIPTIONS:
+            - Transaction_ID: The exact transaction ID provided in the search request input.
+            - Exchange_Rate: A clean floating-point number representing the exchange rate on the given date. Prioritize the bank-specific rate.
+            - Fixed_Fee_Amount: A float representing any flat fee charged by the bank, converted into the 'Transaction_Currency'. If there is no flat fee, return 0.0.
+            - Percentage_Fee_Rate: A float representing any percentage-based fee charged by the bank (e.g., if the fee is 0.1%, return 0.001). If there is no percentage fee, return 0.0."""
+        )
+
+        messages = [{"role": "system", "content": search_system_prompt},
+                    {"role": "user", "content": f"invoice: {invoice_currency}\n\nSearch request: {search_request}"}]
+
+        return self.__clean_json(self.__prompt(self.searching_model, messages))
 
     def validate_transaction(self, invoice_ID):
         invoice = self.__get_invoices(invoice_ID)
+
+        print("Debugging",invoice)
 
         if invoice is None:
             print("Detection result inaccurate, please provide a clearer image.")
@@ -243,6 +280,7 @@ class Agent():
                 raise TypeError(f"Unsupported file type: {invoice['file_type']}")
 
         filter_condition = self.__filter_transactions(invoice)
+        print("Debugging",filter_condition)
 
         bank_filter = filter_condition.get("Bank")
         if bank_filter is False:
@@ -277,12 +315,36 @@ class Agent():
 
         matching_result = self.__find_matching_candidates(invoice, filtered_transactions)
 
+        print("Debugging",matching_result)
+
         if not matching_result or not matching_result.get("Matching_Candidates"):
             print("AI could not find any matching candidates among the retrieved transactions.")
             return
 
         invoice_currency = matching_result.get("Invoice_Currency")
         matching_candidates = matching_result.get("Matching_Candidates")
+
+        valid_transaction_ids = {ID for candidate in matching_candidates for ID in candidate}
+
+        # 1. Filter the list down to only the valid transactions (kept for later use)
+        filtered_transactions = [
+            txn for txn in filtered_transactions
+            if txn["transaction_ID"] in valid_transaction_ids
+        ]
+
+        # 2. Iterate directly over the newly filtered list to build the payload
+        search_request = []
+        for txn in filtered_transactions:
+            payload = {
+                "Transaction_ID": txn["transaction_ID"],
+                "Bank": txn["bank_name"],
+                "Transaction_Currency": txn["currency"],
+                "DateTime_of_Transaction": txn["transaction_datetime"].strftime("%Y-%m-%d %H:%M:%S")
+            }
+            search_request.append(payload)
+
+        transaction_losses = self.__search_transaction_losses(invoice_currency, search_request)
+        print("Debugging", transaction_losses)
 
 
 
