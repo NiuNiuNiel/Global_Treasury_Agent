@@ -422,5 +422,5 @@ class Agent():
             return True
 
         print("--> [ALERT] Confidence below threshold. Flagged for Manual Validation.")
-        return False
+        return best_scenario
 
