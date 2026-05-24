@@ -11,7 +11,7 @@ import docx
 
 
 class Agent():
-    def __init__(self, db_connector, searching_model = "deepseek-v3.2", OCR_model = "kimi-k2.6", fast_model = "glm-4.7-flash", thinking_model = "deepseek-v4-pro"):
+    def __init__(self, db_connector, searching_model = "deepseek-v3.2:web", OCR_model = "kimi-k2.6", fast_model = "glm-4.7-flash", thinking_model = "deepseek-v4-pro"):
         load_dotenv()
         self.client = OpenAI(api_key=os.getenv("MORPHEUS_API_KEY"), base_url=os.getenv("MORPHEUS_BASE_URL"))
         self.searching_model = searching_model
@@ -113,12 +113,12 @@ class Agent():
                 The schema must match exactly:
                 {
                     confidence: float,
-                    invoice_amount: float,"
-                    currency: string,"
-                    vendor: string,"
-                    date: date,"
+                    invoice_amount: float,
+                    currency: string,
+                    vendor: string,
+                    date: date,
                     bank: string,
-                    text_content: string"
+                    text_content: string
                 }
                 
                 Field description:
@@ -256,7 +256,7 @@ class Agent():
         )
 
         messages = [{"role": "system", "content": search_system_prompt},
-                    {"role": "user", "content": f"invoice: {invoice_currency}\n\nSearch request: {search_request}"}]
+                    {"role": "user", "content": f"invoice: {invoice_currency}\n\nSearch request: {json.dumps(search_request)}"}]
 
         return self.__clean_json(self.__prompt(self.searching_model, messages))
 
@@ -345,6 +345,3 @@ class Agent():
 
         transaction_losses = self.__search_transaction_losses(invoice_currency, search_request)
         print("Debugging", transaction_losses)
-
-
-
