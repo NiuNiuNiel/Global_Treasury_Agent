@@ -411,6 +411,269 @@ class BankManagerDialog(ctk.CTkToplevel):
 
 
 # =============================================================================
+#  ACTIVITY LOG DIALOG
+# =============================================================================
+
+_LEVEL_COLORS = {
+    "info":    "#4f8ef7",
+    "success": "#2ecc71",
+    "warning": "#e67e22",
+    "error":   "#e74c3c",
+}
+
+_LEVEL_LABELS = {
+    "info":    "ℹ",
+    "success": "✓",
+    "warning": "⚠",
+    "error":   "✗",
+}
+
+
+class ActivityLogDialog(ctk.CTkToplevel):
+    """Non-modal window showing the in-session + persisted activity log."""
+
+    def __init__(self, master, in_memory_log, db, db_rollback_fn, **kwargs):
+        super().__init__(master, **kwargs)
+        self.title("Activity Log")
+        self.geometry("860x560")
+        self.minsize(700, 400)
+        self.configure(fg_color=C["bg"])
+
+        self._db          = db
+        self._db_rollback = db_rollback_fn
+        self._entries     = []   # list of rendered entry frames
+
+        self._build_ui()
+        self._load_history(in_memory_log)
+
+        # Non-modal — don't grab_set so main window stays usable
+        self.lift()
+        self.focus_set()
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.rowconfigure(0, weight=0)   # header bar
+        self.rowconfigure(1, weight=0)   # column labels
+        self.rowconfigure(2, weight=1)   # scrollable log
+        self.rowconfigure(3, weight=0)   # footer
+        self.columnconfigure(0, weight=1)
+
+        # ── Header ────────────────────────────────────────────────────────────
+        hf = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=0, height=52)
+        hf.grid(row=0, column=0, sticky="ew")
+        hf.grid_propagate(False)
+        hf.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(hf, text="  📋  Activity Log",
+                     font=ctk.CTkFont(size=16, weight="bold"),
+                     text_color=C["text"]).grid(row=0, column=0, padx=16, pady=12, sticky="w")
+
+        ctk.CTkLabel(hf,
+                     text="Live audit trail of all validation events.",
+                     font=ctk.CTkFont(size=11), text_color=C["text_dim"]
+                     ).grid(row=0, column=1, padx=4, pady=12, sticky="w")
+
+        ctk.CTkButton(hf, text="Clear Log",
+                      width=90, height=30, font=ctk.CTkFont(size=11),
+                      fg_color="#3a1010", hover_color="#5a1a1a",
+                      text_color="#e74c3c",
+                      border_width=1, border_color="#e74c3c",
+                      command=self._clear_log
+                      ).grid(row=0, column=2, padx=16, pady=12, sticky="e")
+
+        # ── Column labels ─────────────────────────────────────────────────────
+        ch = ctk.CTkFrame(self, fg_color=C["card"], corner_radius=0, height=28)
+        ch.grid(row=1, column=0, sticky="ew")
+        ch.grid_propagate(False)
+
+        col_defs = [
+            ("",        32,  0),    # level dot
+            ("Time",    90,  0),
+            ("Invoice", 90,  0),
+            ("Event",   200, 1),
+            ("Details", 0,   1),
+        ]
+        for col_idx, (label, minw, wt) in enumerate(col_defs):
+            ch.columnconfigure(col_idx, minsize=minw, weight=wt)
+            ctk.CTkLabel(ch, text=label,
+                         font=ctk.CTkFont(size=10, weight="bold"),
+                         text_color=C["text_muted"], anchor="w"
+                         ).grid(row=0, column=col_idx,
+                                padx=(14 if col_idx == 0 else 6),
+                                pady=3, sticky="ew")
+
+        # ── Scrollable body ───────────────────────────────────────────────────
+        self._scroll = ctk.CTkScrollableFrame(
+            self, fg_color=C["bg"], corner_radius=0,
+            scrollbar_button_color=C["border"],
+            scrollbar_button_hover_color=C["accent"])
+        self._scroll.grid(row=2, column=0, sticky="nsew")
+        self._scroll.columnconfigure(0, weight=1)
+
+        # Placeholder shown when log is empty
+        self._empty_label = ctk.CTkLabel(
+            self._scroll,
+            text="No activity yet — run AI on an invoice to get started.",
+            font=ctk.CTkFont(size=13), text_color=C["text_muted"])
+
+        # ── Footer / status bar ───────────────────────────────────────────────
+        fb = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=0, height=26)
+        fb.grid(row=3, column=0, sticky="ew")
+        fb.grid_propagate(False)
+        fb.columnconfigure(1, weight=1)
+
+        self._count_label = ctk.CTkLabel(
+            fb, text="0 entries",
+            font=ctk.CTkFont(size=10), text_color=C["text_muted"])
+        self._count_label.grid(row=0, column=0, padx=14, pady=3, sticky="w")
+
+        self._db_badge = ctk.CTkLabel(
+            fb,
+            text=("● Persisted to DB" if self._db else "● In-memory only"),
+            font=ctk.CTkFont(size=10),
+            text_color="#2ecc71" if self._db else "#e67e22")
+        self._db_badge.grid(row=0, column=2, padx=14, pady=3, sticky="e")
+
+    # ── Data loading ──────────────────────────────────────────────────────────
+
+    def _load_history(self, in_memory_log):
+        """Populate the log: prefer DB rows; fall back to in-memory list."""
+        entries = []
+
+        if self._db:
+            try:
+                rows = self._db.retrieve_data("activity_log")
+                # retrieve_data returns a list; convert to our entry format
+                for r in (rows or []):
+                    entries.append({
+                        "time":        r.get("logged_at") or datetime.now(),
+                        "invoice_ref": r.get("invoice_ref") or "",
+                        "action":      r.get("action") or "",
+                        "details":     r.get("details") or "",
+                        "level":       r.get("level") or "info",
+                    })
+            except Exception:
+                self._db_rollback()
+                entries = list(in_memory_log)
+        else:
+            entries = list(in_memory_log)
+
+        if not entries:
+            self._show_empty()
+            return
+
+        for entry in entries:
+            self._render_entry(entry)
+        self._scroll_to_bottom()
+
+    def _show_empty(self):
+        self._empty_label.pack(pady=40)
+        self._count_label.configure(text="0 entries")
+
+    def _hide_empty(self):
+        self._empty_label.pack_forget()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def append_entry(self, entry):
+        """Called live by _log_activity when the dialog is already open."""
+        self._hide_empty()
+        self._render_entry(entry)
+        self._scroll_to_bottom()
+
+    # ── Rendering ─────────────────────────────────────────────────────────────
+
+    def _render_entry(self, entry):
+        idx = len(self._entries)
+        bg  = C["row_even"] if idx % 2 == 0 else C["row_odd"]
+
+        level   = entry.get("level", "info")
+        color   = _LEVEL_COLORS.get(level, C["text_dim"])
+        icon    = _LEVEL_LABELS.get(level, "•")
+        ts      = entry.get("time")
+        ts_str  = ts.strftime("%H:%M:%S") if hasattr(ts, "strftime") else str(ts)[:8]
+        ref     = entry.get("invoice_ref") or "—"
+        action  = entry.get("action") or ""
+        details = entry.get("details") or ""
+
+        row = ctk.CTkFrame(self._scroll, fg_color=bg, corner_radius=0)
+        row.pack(fill="x", pady=0)
+        row.columnconfigure(3, weight=1)
+        row.columnconfigure(4, weight=2)
+
+        # Level icon
+        ctk.CTkLabel(row, text=icon, font=ctk.CTkFont(size=13, weight="bold"),
+                     text_color=color, width=28, anchor="center"
+                     ).grid(row=0, column=0, padx=(10, 2), pady=6)
+
+        # Time
+        ctk.CTkLabel(row, text=ts_str, font=ctk.CTkFont(size=11, family="Courier"),
+                     text_color=C["text_muted"], anchor="w", width=72
+                     ).grid(row=0, column=1, padx=(2, 6), pady=6, sticky="w")
+
+        # Invoice ref
+        ctk.CTkLabel(row, text=ref, font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=color, anchor="w", width=82
+                     ).grid(row=0, column=2, padx=(0, 6), pady=6, sticky="w")
+
+        # Action
+        ctk.CTkLabel(row, text=action, font=ctk.CTkFont(size=12),
+                     text_color=C["text"], anchor="w"
+                     ).grid(row=0, column=3, padx=(0, 8), pady=6, sticky="ew")
+
+        # Details (dimmed, may be long — truncate gracefully)
+        if details:
+            disp = details if len(details) <= 80 else details[:77] + "..."
+            ctk.CTkLabel(row, text=disp, font=ctk.CTkFont(size=11),
+                         text_color=C["text_dim"], anchor="w",
+                         wraplength=300
+                         ).grid(row=0, column=4, padx=(0, 12), pady=6, sticky="ew")
+
+        self._entries.append(row)
+        self._count_label.configure(text="{} entr{}".format(
+            len(self._entries), "y" if len(self._entries) == 1 else "ies"))
+
+    def _scroll_to_bottom(self):
+        """Push the scrollable canvas to the bottom so newest entry is visible."""
+        try:
+            self._scroll._parent_canvas.yview_moveto(1.0)
+        except Exception:
+            pass
+
+    # ── Clear ─────────────────────────────────────────────────────────────────
+
+    def _clear_log(self):
+        if not messagebox.askyesno(
+                "Clear Log",
+                "Delete all activity log entries?\n\n"
+                "This will also remove them from the database.",
+                parent=self):
+            return
+
+        # Remove from DB
+        if self._db:
+            try:
+                self._db.cursor.execute("DELETE FROM activity_log")
+                self._db.conn.commit()
+            except Exception:
+                self._db_rollback()
+
+        # Remove in-memory entries from the parent app list
+        if hasattr(self.master, "_activity_log"):
+            self.master._activity_log.clear()
+
+        # Destroy rendered rows
+        for w in self._entries:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._entries.clear()
+        self._show_empty()
+
+
+# =============================================================================
 #  INVOICE ROW
 # =============================================================================
 
@@ -538,6 +801,23 @@ class InvoiceRow(ctk.CTkFrame):
             ctk.CTkLabel(self.action_frame, text="Running...",
                          font=ctk.CTkFont(size=12), text_color=C["accent"]).pack()
 
+        elif status == "error":
+            # Show a Details popup (with the exact error reason) + a Retry button
+            msg = self.invoice.get("_message", "Unknown error — check the activity log.")
+            ctk.CTkButton(self.action_frame, text="Details",
+                          width=62, height=30, font=ctk.CTkFont(size=11),
+                          fg_color="#2a1010", hover_color="#3e1515",
+                          text_color="#e74c3c",
+                          border_width=1, border_color="#e74c3c",
+                          command=lambda m=msg: tk.messagebox.showinfo(
+                              "Validation Error", m)
+                          ).pack(side="left", padx=(0, 4))
+            ctk.CTkButton(self.action_frame, text="Retry",
+                          width=42, height=30, font=ctk.CTkFont(size=11),
+                          fg_color=C["card"], hover_color=C["border"],
+                          border_width=1, border_color=C["border"],
+                          command=lambda: self.on_run_ai(self)).pack(side="left")
+
     def set_processing(self):
         self.invoice["validation_status"] = "processing"
         self.status_badge.update_status("processing")
@@ -546,6 +826,7 @@ class InvoiceRow(ctk.CTkFrame):
 
     def set_result(self, status, confidence, matched_ids=None, message=""):
         self.invoice["validation_status"] = status
+        self.invoice["_message"] = message   # store for Details button
         self.status_badge.update_status(status)
         if confidence is not None:
             pct   = confidence * 100
@@ -595,9 +876,12 @@ class GlobalTreasuryApp(ctk.CTk):
         self._filter_var     = None
         self._search_entry   = None
         self._bank_dialog    = None   # keep reference to avoid GC
+        self._log_dialog     = None   # activity log window
+        self._activity_log   = []     # in-memory log entries
 
         self._build_ui()
         self._connect_backend()
+        self._init_activity_log()     # auto-create DB table if needed
         self._load_invoices()
 
     # =========================================================================
@@ -711,6 +995,13 @@ class GlobalTreasuryApp(ctk.CTk):
                       fg_color=C["card"], hover_color=C["border"],
                       border_width=1, border_color=C["border"],
                       command=self._open_bank_manager).pack(side="left", padx=(0, 8))
+
+        # ── Activity Log button ───────────────────────────────────────────────
+        ctk.CTkButton(btn_frame, text="📋 Log",
+                      width=76, height=32, font=ctk.CTkFont(size=12),
+                      fg_color=C["card"], hover_color=C["border"],
+                      border_width=1, border_color=C["border"],
+                      command=self._open_activity_log).pack(side="left", padx=(0, 8))
 
         ctk.CTkButton(btn_frame, text="Refresh",
                       width=100, height=32, font=ctk.CTkFont(size=12),
@@ -976,9 +1267,19 @@ class GlobalTreasuryApp(ctk.CTk):
                     [filename, path, file_type, requires_ocr, False]
                 )
                 uploaded.append(filename)
+                self._log_activity(
+                    filename, "Invoice Uploaded",
+                    "Type: {} | OCR required: {}".format(file_type, requires_ocr),
+                    level="info",
+                )
             except Exception as e:
                 self._db_rollback()
                 errors.append("{}: {}".format(filename, e))
+                self._log_activity(
+                    filename, "Upload Failed",
+                    str(e),
+                    level="error",
+                )
 
         lines = []
         if uploaded:
@@ -1015,6 +1316,70 @@ class GlobalTreasuryApp(ctk.CTk):
         self._bank_dialog = BankManagerDialog(self, self._db, self._db_rollback)
 
     # =========================================================================
+    #  ACTIVITY LOG
+    # =========================================================================
+
+    def _init_activity_log(self):
+        """Auto-create the activity_log table if it doesn't exist."""
+        if not self._db:
+            return
+        try:
+            self._db.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS activity_log (
+                    log_id    SERIAL PRIMARY KEY,
+                    logged_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    invoice_ref VARCHAR(20),
+                    action    VARCHAR(120) NOT NULL,
+                    details   TEXT,
+                    level     VARCHAR(20) DEFAULT 'info'
+                )
+            """)
+            self._db.conn.commit()
+        except Exception:
+            try:
+                self._db.conn.rollback()
+            except Exception:
+                pass
+
+    def _log_activity(self, invoice_ref, action, details="", level="info"):
+        """Append an entry to the in-memory log and persist to DB."""
+        entry = {
+            "time":        datetime.now(),
+            "invoice_ref": invoice_ref or "",
+            "action":      action,
+            "details":     details,
+            "level":       level,   # info | success | warning | error
+        }
+        self._activity_log.append(entry)
+
+        if self._db:
+            try:
+                self._db.cursor.execute(
+                    "INSERT INTO activity_log (invoice_ref, action, details, level) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (invoice_ref, action, details, level)
+                )
+                self._db.conn.commit()
+            except Exception:
+                try:
+                    self._db.conn.rollback()
+                except Exception:
+                    pass
+
+        # Live-push to the log dialog if it's already open
+        if self._log_dialog and self._log_dialog.winfo_exists():
+            self._log_dialog.append_entry(entry)
+
+    def _open_activity_log(self):
+        if self._log_dialog and self._log_dialog.winfo_exists():
+            self._log_dialog.lift()
+            self._log_dialog.focus_set()
+            return
+        self._log_dialog = ActivityLogDialog(
+            self, self._activity_log, self._db, self._db_rollback
+        )
+
+    # =========================================================================
     #  AI VALIDATION
     # =========================================================================
 
@@ -1024,6 +1389,12 @@ class GlobalTreasuryApp(ctk.CTk):
         if t and t.is_alive():
             return
         row.set_processing()
+        self._log_activity(
+            row.invoice.get("invoice_id", ""),
+            "Validation Started",
+            "AI agent dispatched for invoice {}".format(row.invoice.get("invoice_id", db_id)),
+            level="info",
+        )
         t = threading.Thread(target=self._validation_worker, args=(db_id, row), daemon=True)
         self._active_threads[db_id] = t
         t.start()
@@ -1050,6 +1421,12 @@ class GlobalTreasuryApp(ctk.CTk):
                 if raw is None:
                     result = {"status": "error", "confidence": None,
                               "matched_ids": [], "message": "Agent returned None — check logs",
+                              "_agent_wrote_db": False}
+
+                elif isinstance(raw, dict) and raw.get("error"):
+                    result = {"status": "error", "confidence": None,
+                              "matched_ids": [],
+                              "message": raw.get("message", "Unknown agent error"),
                               "_agent_wrote_db": False}
 
                 elif isinstance(raw, dict) and "validated" in raw:
@@ -1103,6 +1480,31 @@ class GlobalTreasuryApp(ctk.CTk):
         agent_wrote = result.get("_agent_wrote_db", False)
 
         row.set_result(status, confidence, matched_ids, result.get("message", ""))
+
+        # ── Activity log ──────────────────────────────────────────────────────
+        inv_ref = row.invoice.get("invoice_id", str(db_id))
+        if status == "auto_validated":
+            self._log_activity(
+                inv_ref, "Auto-Validated",
+                "Confidence {:.1f}% — matched transaction(s): {}".format(
+                    (confidence or 0) * 100,
+                    ", ".join(str(t) for t in matched_ids) or "none"),
+                level="success",
+            )
+        elif status == "needs_manual":
+            self._log_activity(
+                inv_ref, "Needs Manual Review",
+                "Confidence {:.1f}% — below auto-approval threshold.".format(
+                    (confidence or 0) * 100),
+                level="warning",
+            )
+        elif status == "error":
+            self._log_activity(
+                inv_ref, "Validation Error",
+                result.get("message", "Unknown error"),
+                level="error",
+            )
+        # ─────────────────────────────────────────────────────────────────────
 
         for inv in self._invoices:
             if inv.get("_db_id") == db_id:
@@ -1179,9 +1581,20 @@ class GlobalTreasuryApp(ctk.CTk):
                         )
                     except Exception:
                         self._db_rollback()
+                self._log_activity(
+                    display_id, "Manually Approved",
+                    "Confidence {:.1f}% | Matched: {}".format(
+                        confidence * 100,
+                        ", ".join(str(t) for t in matched_ids) or "none"),
+                    level="success",
+                )
             except Exception as e:
                 self._db_rollback()
                 messagebox.showerror("DB Error", "Could not update database:\n{}".format(e))
+                self._log_activity(display_id, "Approval DB Error", str(e), level="error")
+        else:
+            self._log_activity(display_id, "Manually Approved", "No DB — in-memory only",
+                               level="success")
 
         self._update_stats()
 

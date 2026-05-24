@@ -308,7 +308,8 @@ class Agent():
 
         if invoice is None:
             print("Detection result inaccurate, please provide a clearer image.")
-            return None
+            return {"error": True,
+                    "message": "OCR quality too low — image may be unclear or low resolution. Try uploading a higher quality scan."}
 
         if invoice["OCR"]:
             invoice = json.dumps(invoice["OCR_result"])
@@ -326,7 +327,8 @@ class Agent():
         bank_filter = filter_condition.get("Bank")
         if bank_filter is False:
             print("Bank given by the filter model has not been registered.")
-            return None
+            return {"error": True,
+                    "message": "Invoice references a bank not registered in the system. Open the 🏦 Banks panel and add it, then retry."}
         elif not bank_filter:  # This safely catches None AND []
             bank_filter = [dic.get("bank_name") for dic in
                            self.db_connector.retrieve_data("registered_banks", ["bank_name"])]
@@ -337,7 +339,8 @@ class Agent():
             start_date, end_date = [date.strip() for date in filter_condition["Date_Window"].split("AND")]
         except ValueError:
             print("Error parsing Date_Window from model. Fallback needed.")
-            return None
+            return {"error": True,
+                    "message": "Could not parse the transaction date window from the invoice. Check the invoice date is readable."}
 
         end_timestamp = f"{end_date} 23:59:59"
 
@@ -352,7 +355,8 @@ class Agent():
 
         if not filtered_transactions:
             print("No transactions found in the database for this search window.")
-            return None
+            return {"error": True,
+                    "message": f"No unmatched transactions found between {start_date} and {end_date} for the registered bank(s). Insert transaction records and retry."}
 
         matching_result = self.__find_matching_candidates(invoice, filtered_transactions)
 
@@ -360,19 +364,20 @@ class Agent():
 
         if not matching_result or not matching_result.get("Matching_Candidates"):
             print("AI could not find any matching candidates among the retrieved transactions.")
-            return None
-        print("checkpoint1")
+            return {"error": True,
+                    "message": f"AI found no plausible matching transactions among {len(filtered_transactions)} candidate(s) in the search window. The payment may not have cleared yet."}
+
         invoice_currency = matching_result.get("Invoice_Currency")
         matching_candidates = matching_result.get("Matching_Candidates")
 
         valid_transaction_ids = {ID for candidate in matching_candidates for ID in candidate}
-        print("checkpoint2")
+
         # 1. Filter the list down to only the valid transactions (kept for later use)
         filtered_transactions = [
             txn for txn in filtered_transactions
             if txn["transaction_id"] in valid_transaction_ids
         ]
-        print("checkpoint3")
+
         # 2. Iterate directly over the newly filtered list to build the payload
         search_request = []
         for txn in filtered_transactions:
@@ -383,7 +388,7 @@ class Agent():
                 "DateTime_of_Transaction": txn["transaction_datetime"].strftime("%Y-%m-%d %H:%M:%S")
             }
             search_request.append(payload)
-        print("search request",search_request)
+
         transaction_losses = self.__search_transaction_losses(invoice_currency, search_request)
         print("Debugging", transaction_losses)
 
@@ -391,7 +396,8 @@ class Agent():
 
         if not invoice_amount:
             print("Error: Could not determine the original invoice amount for calculation.")
-            return None
+            return {"error": True,
+                    "message": "Could not extract the invoice amount — check OCR results are correct for this invoice."}
 
         # 2. Convert lists to dictionaries for O(1) instant data lookups
         loss_lookup = {loss["Transaction_ID"]: loss for loss in transaction_losses}
