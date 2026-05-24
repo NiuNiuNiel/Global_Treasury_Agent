@@ -91,10 +91,10 @@ class Agent():
         return response.choices[0].message.content
 
     def __get_invoices(self, invoice_ID):
-        invoice_metadata = self.db_connector.retrieve_data("invoices", condition=f"WHERE `invoice_ID` == {invoice_ID}")[0]
+        invoice_metadata = self.db_connector.retrieve_data("invoices", condition="`invoice_ID` = %s", condition_values=(invoice_ID,))[0]
         if invoice_metadata["requires_OCR"]:
             if invoice_metadata["OCR_status"]:
-               return json.loads(self.db_connector.retrieve_data("OCR_results"))
+               return json.loads(self.db_connector.retrieve_data("OCR_results",["OCR_result"],"`invoice_ID` = %s",(invoice_ID,)))
 
             try:
                 with open(invoice_metadata["file_path"], "rb") as image:
@@ -102,29 +102,87 @@ class Agent():
             except FileNotFoundError:
                 raise RuntimeError(f"File {invoice_metadata['file_path']} not found.")
 
-            messages = [{"role":"system","content":""""""},
-                        {"role":"user","content":{"type":"base64", "base64":encoded_image}}]
+            ocr_system_prompt = (
+                """You are an expert financial OCR model. Analyze the provided invoice image and extract key details.
+                You must return your response strictly as a raw JSON object with no markdown formatting or wrappers.
+                The schema must match exactly:
+                {
+                    confidence: float,
+                    invoice_amount: float,"
+                    currency: string,"
+                    vendor: string,"
+                    date: date,"
+                    bank: string,
+                    text_content: string"
+                }
+                
+                Field description:
+                - confidence: A floating-point number between 0.00 and 1.00 indicating your extraction confidence accuracy. If you are highly uncertain of the text legibility, score it below 0.90.
+                - invoice_amount: The total final payable amount indicated on the invoice. Must be a clean floating-point number (e.g., 1250.50). Do not include currency symbols or thousands separators.
+                - currency: The standard 3-letter ISO currency code representing the invoice currency (e.g., 'USD', 'MYR', 'EUR', 'SGD').
+                - vendor: The name of the merchant, company, or individual issuing the invoice (e.g., 'Example Corp').
+                - date: The date the invoice was issued, strictly formatted as an ISO 8601 string ('YYYY-MM-DD').
+                - bank: The name of the receiving bank listed in the payment instructions section of the invoice if available (e.g., 'Maybank', 'CIMB'). If no specific bank is found, return null.
+                - text_content: A single flat text string containing the entire raw text layer extracted from the document for fallback matching purposes. Escaped line breaks are permitted.
+                """
+            )
+
+            messages = [
+                {"role": "system", "content": ocr_system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{encoded_image}"}
+                        }
+                    ]
+                }
+            ]
 
             OCR_result = json.loads(self.__prompt(self.OCR_model, messages))
-            self.db_connector.update_data("invoices", "OCR_status", True)
+
+            if OCR_result["confidence"] < 0.90:
+                self.db_connector.update_data("invoices", ["OCR_status"], [False], "`invoice_ID` = %s",(invoice_ID,))
+                print("Detection result inaccurate, please upload a clearer picture.")
+                return
+
+            self.db_connector.update_data("invoices", ["OCR_status"], [True], "`invoice_ID` = %s",(invoice_ID,))
             self.db_connector.insert_data("OCR_results", ["invoice_ID", "OCR_result"], [invoice_ID, OCR_result])
 
             return {"OCR":True, "OCR_result":OCR_result}
 
         return {"OCR":False, "file_path":invoice_metadata["file_path"], "file_type":invoice_metadata["file_type"]}
 
-    def validate_transaction(self, invoice_ID):
-        invoice = self.__get_invoices(invoice_ID)
+    def __filter_transactions(self, invoice):
+        registered_banks = [bank["bank_name"] for bank in
+                            json.loads(self.db_connector.retrieve_data("registered_banks", ["bank_name"]))]
         messages = [{"role":"system","content":""""""}]
         if invoice["OCR"]:
-            messages.append({"role":"user", "content": invoice["OCR_results"]})
+            messages.append({"role": "user", "content": invoice["OCR_result"]})
         else:
             if invoice["file_type"] == "pdf":
-                content = self.process_pdf(invoice["file_path"])
+                content = self.__pdf_extraction(invoice["file_path"])
             elif invoice["file_type"] == "docx":
-                content = None
+                content = self.__word_doc_extraction(invoice["file_path"])
+            else:
+                raise TypeError(f"Unsupported file type: {invoice['file_type']}")
 
-            messages.append({"role":"user", "content": content})
+            messages.append({"role": "user", "content": content})
+
+        return json.loads(self.__prompt(self.fast_model, messages))
+
+    def validate_transaction(self, invoice_ID):
+        invoice = self.__get_invoices(invoice_ID)
+        filter = self.__filter_transactions(invoice)
+
+        if filter["bank"] is None:
+            filter["bank"] = self.db_connector.retrieve_data("registered_banks", ["bank_name"])
+        elif filter["bank"] is False:
+            print("Bank given by the filter model has not been registered.")
+            return
+
+
 
 
 
