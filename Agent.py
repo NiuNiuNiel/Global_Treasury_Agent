@@ -197,7 +197,7 @@ class Agent():
                             self.db_connector.retrieve_data("registered_banks", ["bank_name"])]
 
         filter_system_prompt = (
-                """You are an AI treasury routing agent. Given invoice text data and a list of system-registered banks, 
+                """You are an AI treasury routing agent. Given invoice text data and a list of system-registered banks,
                 your task is to isolate which bank or banks the transaction likely went through, and determine a realistic
                 search date window based on the invoice's date context.\n\n""" +
 
@@ -206,15 +206,15 @@ class Agent():
                 """Instructions:
                 1. Identify all suitable 'Bank' options from the allowed list. Return them as a list of strings. If it does not match any registered bank, return false for that key, or null if there is no bank being mentioned.
                 2. Generate a 'Date_Window' suffix or clause suitable for a database filter (e.g., a specific start and end date).
-    
+
                 Return strictly a raw JSON object conforming exactly to this layout:
                 {
                     "Bank": ["Maybank", "CIMB"],
                     "Date_Window": "2026-05-23 AND 2026-05-26"
                 }
-    
+
                 Field descriptions:
-                - Bank: 
+                - Bank:
                     - A list of explicit bank names identified from the invoice payment instructions. Each item MUST be an exact string match to one of the options provided in the 'Registered Banks in System' list.
                     - If no bank is mentioned, return null.
                     - If the mentioned bank(s) are not on the registered list, return the boolean value false.
@@ -264,15 +264,15 @@ class Agent():
 
     def __search_transaction_losses(self, invoice_currency, search_request):
         search_system_prompt = (
-            """You are an expert AI financial researcher and treasury analyst. 
+            """You are an expert AI financial researcher and treasury analyst.
             Your task is to determine the historical exchange rates and standard fee deduction policies for a list of bank transactions.
 
             You will be provided with the original 'invoice' currency and a 'Search request' containing a list of transaction details.
 
             INSTRUCTIONS & REASONING LOGIC:
-            1. Exchange Rate: For each transaction, determine the exchange rate to convert from the original invoice currency to the 'Transaction_Currency' on the specific 'DateTime_of_Transaction'. 
+            1. Exchange Rate: For each transaction, determine the exchange rate to convert from the original invoice currency to the 'Transaction_Currency' on the specific 'DateTime_of_Transaction'.
                - If the invoice currency and the transaction currency are identical, the exchange rate is exactly 1.0.
-               - If they differ, FIRST attempt to find the specific 'Bank's historical exchange rate (e.g., the Bank's Telegraphic Transfer (TT) Selling rate) for that exact date. 
+               - If they differ, FIRST attempt to find the specific 'Bank's historical exchange rate (e.g., the Bank's Telegraphic Transfer (TT) Selling rate) for that exact date.
                - If the specific bank's exchange rate data for that date is unavailable, FALLBACK to the general/mid-market historical exchange rate for that date.
             2. Fee Policy: Identify the standard corporate receiving/transfer fee policy for the specified 'Bank'. Break this policy down into a fixed fee and a percentage rate.
 
@@ -337,10 +337,20 @@ class Agent():
 
         try:
             start_date, end_date = [date.strip() for date in filter_condition["Date_Window"].split("AND")]
-        except ValueError:
+            # Validate start date is a real calendar date
+            start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
+        except (ValueError, KeyError):
             print("Error parsing Date_Window from model. Fallback needed.")
             return {"error": True,
                     "message": "Could not parse the transaction date window from the invoice. Check the invoice date is readable."}
+
+        # Validate end date — LLMs sometimes produce impossible dates (e.g. Feb 29
+        # in a non-leap year). If so, fall back to start_date + 30 days.
+        try:
+            datetime.datetime.strptime(end_date, "%Y-%m-%d")
+        except ValueError:
+            print(f"LLM returned invalid end date '{end_date}' — falling back to +30 days.")
+            end_date = (start_dt + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
 
         end_timestamp = f"{end_date} 23:59:59"
 
@@ -372,13 +382,13 @@ class Agent():
 
         valid_transaction_ids = {ID for candidate in matching_candidates for ID in candidate}
 
-        # 1. Filter the list down to only the valid transactions (kept for later use)
+        # Filter the list down to only the valid transactions
         filtered_transactions = [
             txn for txn in filtered_transactions
             if txn["transaction_id"] in valid_transaction_ids
         ]
 
-        # 2. Iterate directly over the newly filtered list to build the payload
+        # Build the payload for the loss/exchange-rate search
         search_request = []
         for txn in filtered_transactions:
             payload = {
@@ -399,33 +409,36 @@ class Agent():
             return {"error": True,
                     "message": "Could not extract the invoice amount — check OCR results are correct for this invoice."}
 
-        # 2. Convert lists to dictionaries for O(1) instant data lookups
+        # Convert lists to dictionaries for O(1) instant data lookups
         loss_lookup = {loss["Transaction_ID"]: loss for loss in transaction_losses}
-        txn_lookup = {txn["transaction_id"]: txn for txn in filtered_transactions}
+        txn_lookup  = {txn["transaction_id"]: txn for txn in filtered_transactions}
 
-        best_scenario = None
+        best_scenario    = None
         highest_confidence = 0.0
 
-        # 3. Calculate Confidence Score
+        # ── Confidence Score Calculation ─────────────────────────────────────
+        # Logic: convert each transaction amount back to the invoice currency
+        # (divide by exchange rate), add back fees to get what the sender
+        # originally sent, then compare that sum to the invoice amount.
         for scenario in matching_candidates:
             scenario_expected_amount = 0.0
 
             for txn_id in scenario:
-                txn = txn_lookup.get(txn_id)
+                txn  = txn_lookup.get(txn_id)
                 loss = loss_lookup.get(txn_id)
 
                 if not txn or not loss:
                     continue
 
-                # Extract loss parameters
-                exchange_rate = loss["Exchange_Rate"]
-                fixed_fee = loss["Fixed_Fee_Amount"]
-                percentage_rate = loss["Percentage_Fee_Rate"]
+                exchange_rate    = loss["Exchange_Rate"]
+                fixed_fee        = loss["Fixed_Fee_Amount"]
+                percentage_rate  = loss["Percentage_Fee_Rate"]
 
-                # Calculate exactly as your workflow diagram dictates
-                converted_gross = float(txn["amount"]) / exchange_rate
-                platform_fees = fixed_fee + (converted_gross * percentage_rate)
-                expected_amount = converted_gross + platform_fees
+                # Convert transaction amount back to invoice currency, then
+                # add fees back to recover the gross amount the payer sent.
+                converted_gross  = float(txn["amount"]) / exchange_rate
+                platform_fees    = fixed_fee + (converted_gross * percentage_rate)
+                expected_amount  = converted_gross + platform_fees
 
                 scenario_expected_amount += expected_amount
 
@@ -435,7 +448,8 @@ class Agent():
             if scenario_expected_amount > 0:
                 confidence = (scenario_expected_amount / invoice_amount) * 100
 
-                # Penalize variances in both directions (e.g., if confidence is 105%, it's functionally a 95% match)
+                # Penalise variances in both directions
+                # (e.g. 105% confidence is functionally a 95% match)
                 if confidence > 100.0:
                     confidence = 100.0 - (confidence - 100.0)
 
@@ -445,28 +459,25 @@ class Agent():
 
         print(f"--> Generated Highest Confidence: {highest_confidence:.2f}% for scenario: {best_scenario}")
 
-        # 4. Satisfy Validation Confident Threshold
+        # ── Threshold check ───────────────────────────────────────────────────
         CONFIDENCE_THRESHOLD = 95.0
 
-        # FIX: normalise confidence to 0-1 scale before storing and returning.
-        # Agent calculates confidence on a 0-100 scale; main.py and the DB use 0-1.
+        # Normalise to 0-1 scale before storing / returning —
+        # main.py and the DB both use 0-1, Agent calculates on 0-100.
         confidence_normalised = highest_confidence / 100.0
 
         if highest_confidence >= CONFIDENCE_THRESHOLD:
             print("--> [SUCCESS] Threshold met. Validating payment in database...")
 
-            # Update the main invoice table
-            self.db_connector.update_data("invoices", ["validation_status"], [True], "invoice_ID = %s", (invoice_ID,))
-
-            # FIX: column "invoice_id" (lowercase); store normalised 0-1 confidence
+            self.db_connector.update_data(
+                "invoices", ["validation_status"], [True],
+                "invoice_ID = %s", (invoice_ID,)
+            )
             self.db_connector.insert_data(
                 "validation_details",
                 ["invoice_id", "confidence_score"],
                 [invoice_ID, confidence_normalised]
             )
-
-            # Insert into the mapping table (handles split payments natively!)
-            # FIX: table "validation_transactions", columns lowercase
             for txn_id in best_scenario:
                 self.db_connector.insert_data(
                     "validation_transactions",
@@ -474,20 +485,16 @@ class Agent():
                     [invoice_ID, txn_id]
                 )
 
-            # FIX: return a dict so main.py can parse the result uniformly.
-            # The agent has already written everything to the DB.
             return {
-                "validated": True,
-                "confidence": confidence_normalised,
-                "transactions": best_scenario,
+                "validated":     True,
+                "confidence":    confidence_normalised,
+                "transactions":  best_scenario,
             }
 
         print("--> [ALERT] Confidence below threshold. Flagged for Manual Validation.")
 
-        # FIX: return a dict (not a bare list) so main.py can parse uniformly.
-        # DB is NOT updated here — main.py writes when the user clicks Approve.
         return {
-            "validated": False,
-            "confidence": confidence_normalised,
+            "validated":    False,
+            "confidence":   confidence_normalised,
             "transactions": best_scenario,
         }
