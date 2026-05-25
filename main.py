@@ -827,6 +827,8 @@ class InvoiceRow(ctk.CTkFrame):
     def set_result(self, status, confidence, matched_ids=None, message=""):
         self.invoice["validation_status"] = status
         self.invoice["_message"] = message   # store for Details button
+        self.invoice["_confidence"] = confidence
+        self.invoice["_matched_ids"] = matched_ids or []
         self.status_badge.update_status(status)
         if confidence is not None:
             pct   = confidence * 100
@@ -856,6 +858,275 @@ class InvoiceRow(ctk.CTkFrame):
 
 
 # =============================================================================
+#  MANUAL VALIDATION REVIEW
+# =============================================================================
+
+class ManualValidationDialog(ctk.CTkToplevel):
+    """Read-only cross-check window shown before a manual validation is approved."""
+
+    def __init__(self, master, invoice, review_data, on_approve, **kwargs):
+        super().__init__(master, **kwargs)
+        self.title("Manual Validation Review")
+        self.geometry("920x680")
+        self.minsize(760, 560)
+        self.configure(fg_color=C["bg"])
+
+        self._invoice = invoice
+        self._review_data = review_data or {}
+        self._on_approve = on_approve
+        self._preview_images = []
+
+        self._build_ui()
+        self.grab_set()
+        self.focus_set()
+        self.lift()
+
+    def _build_ui(self):
+        self.rowconfigure(1, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        header = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=0)
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+
+        title = "Manual validation: {}".format(self._invoice.get("invoice_id", "-"))
+        ctk.CTkLabel(header, text=title,
+                     font=ctk.CTkFont(size=18, weight="bold"),
+                     text_color=C["text"], anchor="w"
+                     ).grid(row=0, column=0, padx=20, pady=(16, 2), sticky="ew")
+
+        conf = self._invoice.get("_confidence")
+        conf_text = "Confidence: {:.1f}%".format(conf * 100) if conf is not None else "Confidence: -"
+        ctk.CTkLabel(header,
+                     text="Cross-check the database values before approving. {}".format(conf_text),
+                     font=ctk.CTkFont(size=12),
+                     text_color=C["text_dim"], anchor="w"
+                     ).grid(row=1, column=0, padx=20, pady=(0, 16), sticky="ew")
+
+        body = ctk.CTkScrollableFrame(self, fg_color=C["bg"], corner_radius=0)
+        body.grid(row=1, column=0, sticky="nsew", padx=18, pady=18)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+
+        self._section(body, "Invoice Summary", self._invoice_summary_items(), 0, 0)
+        if self._should_show_source_file():
+            self._file_preview_section(body, 0, 1)
+        else:
+            self._section(body, "Extracted OCR Data", self._dict_items(self._review_data.get("ocr_result")), 0, 1)
+        self._section(body, "Invoice DB Row", self._dict_items(self._review_data.get("invoice_row")), 1, 0)
+        self._transactions_section(body, 1, 1)
+
+        footer = ctk.CTkFrame(self, fg_color=C["panel"], corner_radius=0)
+        footer.grid(row=2, column=0, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+
+        ctk.CTkButton(footer, text="Close",
+                      width=120, height=34,
+                      fg_color=C["card"], hover_color=C["border"],
+                      border_width=1, border_color=C["border"],
+                      command=self.destroy
+                      ).grid(row=0, column=1, padx=(0, 10), pady=14)
+        ctk.CTkButton(footer, text="Approve Validation",
+                      width=170, height=34,
+                      fg_color="#1a4a1a", hover_color="#265526",
+                      text_color="#2ecc71",
+                      border_width=1, border_color="#2ecc71",
+                      command=self._approve
+                      ).grid(row=0, column=2, padx=(0, 18), pady=14)
+
+    def _section(self, master, title, items, row, col):
+        frame = ctk.CTkFrame(master, fg_color=C["card"], corner_radius=8,
+                             border_width=1, border_color=C["border"])
+        frame.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
+        frame.columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(frame, text=title,
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=C["text"], anchor="w"
+                     ).grid(row=0, column=0, columnspan=2, padx=14, pady=(12, 8), sticky="ew")
+
+        if not items:
+            ctk.CTkLabel(frame, text="No data found.",
+                         font=ctk.CTkFont(size=12), text_color=C["text_muted"],
+                         anchor="w").grid(row=1, column=0, columnspan=2, padx=14, pady=(0, 14), sticky="ew")
+            return
+
+        for idx, (key, value) in enumerate(items, start=1):
+            ctk.CTkLabel(frame, text=str(key),
+                         font=ctk.CTkFont(size=11, weight="bold"),
+                         text_color=C["text_dim"], anchor="w"
+                         ).grid(row=idx, column=0, padx=(14, 10), pady=3, sticky="nw")
+            ctk.CTkLabel(frame, text=self._display_value(value),
+                         font=ctk.CTkFont(size=12),
+                         text_color=C["text"], anchor="w",
+                         wraplength=260, justify="left"
+                         ).grid(row=idx, column=1, padx=(0, 14), pady=3, sticky="ew")
+
+    def _transactions_section(self, master, row, col):
+        txns = self._review_data.get("transactions") or []
+        items = []
+        for idx, txn in enumerate(txns, start=1):
+            if isinstance(txn, dict):
+                txn_id = txn.get("transaction_id") or txn.get("transaction_ID") or "Transaction {}".format(idx)
+                detail_bits = []
+                for key in ("bank_name", "transaction_datetime", "amount", "currency", "description"):
+                    if key in txn and txn.get(key) not in (None, ""):
+                        detail_bits.append("{}: {}".format(key, self._display_value(txn.get(key))))
+                items.append((txn_id, "\n".join(detail_bits) if detail_bits else txn))
+            else:
+                items.append(("Transaction {}".format(idx), txn))
+        self._section(master, "Matched Transaction Data", items, row, col)
+
+    def _file_preview_section(self, master, row, col):
+        info = self._source_file_info()
+        path = info.get("file_path", "")
+        file_type = (info.get("file_type") or "").lower()
+        title = "Original Invoice File"
+
+        frame = ctk.CTkFrame(master, fg_color=C["card"], corner_radius=8,
+                             border_width=1, border_color=C["border"])
+        frame.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
+        frame.columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(frame, text=title,
+                     font=ctk.CTkFont(size=14, weight="bold"),
+                     text_color=C["text"], anchor="w"
+                     ).grid(row=0, column=0, padx=14, pady=(12, 4), sticky="ew")
+
+        ctk.CTkLabel(frame,
+                     text="{} file from database path:\n{}".format(file_type.upper(), path or "-"),
+                     font=ctk.CTkFont(size=11),
+                     text_color=C["text_dim"], anchor="w",
+                     wraplength=340, justify="left"
+                     ).grid(row=1, column=0, padx=14, pady=(0, 8), sticky="ew")
+
+        ctk.CTkButton(frame, text="Open Source File",
+                      width=150, height=30,
+                      fg_color=C["accent"], hover_color=C["accent_dim"],
+                      command=lambda p=path: self._open_source_file(p)
+                      ).grid(row=2, column=0, padx=14, pady=(0, 10), sticky="w")
+
+        if not path or not os.path.exists(path):
+            self._preview_message(frame, "File not found at the stored database path.", 3)
+            return
+
+        if file_type == "pdf":
+            photo, error = self._render_pdf_preview(path)
+            if photo:
+                self._preview_images.append(photo)
+                tk.Label(frame, image=photo, bg=C["card"], borderwidth=0
+                         ).grid(row=3, column=0, padx=14, pady=(0, 14), sticky="n")
+            else:
+                self._preview_message(frame, error or "PDF preview unavailable.", 3)
+        elif file_type == "docx":
+            text, error = self._extract_docx_preview(path)
+            if text:
+                box = ctk.CTkTextbox(frame, height=260, fg_color=C["row_even"],
+                                     text_color=C["text"], border_width=1,
+                                     border_color=C["border"], wrap="word")
+                box.grid(row=3, column=0, padx=14, pady=(0, 14), sticky="nsew")
+                box.insert("1.0", text)
+                box.configure(state="disabled")
+            else:
+                self._preview_message(frame, error or "DOCX preview unavailable.", 3)
+        else:
+            self._preview_message(frame, "Preview is only enabled for PDF and DOCX invoices.", 3)
+
+    def _preview_message(self, frame, message, row):
+        ctk.CTkLabel(frame, text=message,
+                     font=ctk.CTkFont(size=12),
+                     text_color=C["text_muted"], anchor="w",
+                     wraplength=340, justify="left"
+                     ).grid(row=row, column=0, padx=14, pady=(0, 14), sticky="ew")
+
+    def _source_file_info(self):
+        row = self._review_data.get("invoice_row") or {}
+        return {
+            "file_path": row.get("file_path") or row.get("File_Path") or "",
+            "file_type": row.get("file_type") or row.get("File_Type") or "",
+        }
+
+    def _should_show_source_file(self):
+        info = self._source_file_info()
+        return (info.get("file_type") or "").lower() in ("pdf", "docx")
+
+    def _render_pdf_preview(self, path):
+        try:
+            import fitz
+            from PIL import Image, ImageTk
+
+            doc = fitz.open(path)
+            try:
+                page = doc.load_page(0)
+                pix = page.get_pixmap(matrix=fitz.Matrix(1.25, 1.25), alpha=False)
+                image = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+                image.thumbnail((360, 460))
+                return ImageTk.PhotoImage(image), None
+            finally:
+                doc.close()
+        except Exception as e:
+            return None, "Could not render PDF preview: {}".format(e)
+
+    def _extract_docx_preview(self, path):
+        try:
+            from docx import Document
+
+            doc = Document(path)
+            parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            for table in doc.tables:
+                for table_row in table.rows:
+                    cells = [cell.text.strip() for cell in table_row.cells if cell.text.strip()]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            text = "\n".join(parts).strip()
+            if len(text) > 4000:
+                text = text[:4000] + "\n\n[Preview truncated]"
+            return text, None
+        except Exception as e:
+            return "", "Could not read DOCX preview: {}".format(e)
+
+    def _open_source_file(self, path):
+        if not path or not os.path.exists(path):
+            messagebox.showerror("File Not Found",
+                                 "The source file does not exist at the stored path:\n{}".format(path),
+                                 parent=self)
+            return
+        try:
+            os.startfile(path)
+        except Exception as e:
+            messagebox.showerror("Open File Failed", str(e), parent=self)
+
+    def _invoice_summary_items(self):
+        fields = [
+            ("Invoice ID", self._invoice.get("invoice_id")),
+            ("Date", self._invoice.get("date_of_purchase")),
+            ("Amount", self._invoice.get("amount")),
+            ("Currency", self._invoice.get("currency")),
+            ("Description", self._invoice.get("description")),
+            ("Matched IDs", ", ".join(str(t) for t in self._invoice.get("_matched_ids", []) or [])),
+        ]
+        return [(k, v) for k, v in fields if v not in (None, "")]
+
+    def _dict_items(self, value):
+        if not value:
+            return []
+        if isinstance(value, dict):
+            return list(value.items())
+        return [("Value", value)]
+
+    def _display_value(self, value):
+        if value is None:
+            return "-"
+        if isinstance(value, float):
+            return "{:,.4f}".format(value).rstrip("0").rstrip(".")
+        return str(value)
+
+    def _approve(self):
+        self.destroy()
+        self._on_approve()
+
+
+# =============================================================================
 #  MAIN APPLICATION
 # =============================================================================
 
@@ -877,6 +1148,7 @@ class GlobalTreasuryApp(ctk.CTk):
         self._search_entry   = None
         self._bank_dialog    = None   # keep reference to avoid GC
         self._log_dialog     = None   # activity log window
+        self._manual_review_dialogs = {}
         self._activity_log   = []     # in-memory log entries
 
         self._build_ui()
@@ -1498,6 +1770,7 @@ class GlobalTreasuryApp(ctk.CTk):
                     (confidence or 0) * 100),
                 level="warning",
             )
+            self._open_manual_review(row, auto_open=True)
         elif status == "error":
             self._log_activity(
                 inv_ref, "Validation Error",
@@ -1545,15 +1818,116 @@ class GlobalTreasuryApp(ctk.CTk):
     # =========================================================================
 
     def _approve_row(self, row):
+        self._open_manual_review(row, auto_open=False)
+
+    def _open_manual_review(self, row, auto_open=False):
+        display_id  = row.invoice["invoice_id"]
+        db_id       = row.invoice.get("_db_id", display_id)
+
+        existing = self._manual_review_dialogs.get(db_id)
+        if existing and existing.winfo_exists():
+            existing.focus_set()
+            existing.lift()
+            return
+
+        review_data = self._get_manual_review_data(row.invoice)
+        dialog = ManualValidationDialog(
+            self,
+            row.invoice,
+            review_data,
+            on_approve=lambda r=row: self._commit_manual_approval(r),
+        )
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        self._manual_review_dialogs[db_id] = dialog
+        dialog.bind("<Destroy>", lambda _event, key=db_id: self._manual_review_dialogs.pop(key, None))
+
+        if auto_open:
+            self._log_activity(
+                display_id, "Manual Review Window Opened",
+                "Database invoice and matched transaction data loaded for cross-check.",
+                level="info",
+            )
+
+    def _get_manual_review_data(self, invoice):
+        db_id = invoice.get("_db_id")
+        data = {
+            "invoice_row": None,
+            "ocr_result": None,
+            "transactions": [],
+        }
+
+        if not self._db or db_id is None:
+            data["ocr_result"] = {
+                "date": invoice.get("date_of_purchase"),
+                "invoice_amount": invoice.get("amount"),
+                "currency": invoice.get("currency"),
+                "vendor": invoice.get("description"),
+            }
+            return data
+
+        try:
+            invoice_rows = self._db.retrieve_data(
+                "invoices",
+                condition="invoice_id = %s",
+                condition_values=(db_id,)
+            )
+            if not invoice_rows:
+                invoice_rows = self._db.retrieve_data(
+                    "invoices",
+                    condition="invoice_ID = %s",
+                    condition_values=(db_id,)
+                )
+            data["invoice_row"] = invoice_rows[0] if invoice_rows else None
+        except Exception:
+            self._db_rollback()
+
+        try:
+            ocr_rows = self._db.retrieve_data(
+                "ocr_results",
+                condition="invoice_id = %s",
+                condition_values=(db_id,)
+            )
+            if not ocr_rows:
+                ocr_rows = self._db.retrieve_data(
+                    "ocr_results",
+                    condition="invoice_ID = %s",
+                    condition_values=(db_id,)
+                )
+            if ocr_rows:
+                import json as _json
+                result = ocr_rows[0].get("ocr_result") or ocr_rows[0].get("OCR_result")
+                if isinstance(result, str):
+                    result = _json.loads(result)
+                data["ocr_result"] = result
+        except Exception:
+            self._db_rollback()
+
+        matched_ids = invoice.get("_matched_ids") or []
+        if matched_ids:
+            try:
+                data["transactions"] = self._db.retrieve_data(
+                    "transactions",
+                    condition="transaction_id IN %s",
+                    condition_values=(tuple(matched_ids),)
+                )
+            except Exception:
+                self._db_rollback()
+                try:
+                    data["transactions"] = self._db.retrieve_data(
+                        "transactions",
+                        condition="transaction_ID IN %s",
+                        condition_values=(tuple(matched_ids),)
+                    )
+                except Exception:
+                    self._db_rollback()
+
+        return data
+
+    def _commit_manual_approval(self, row):
         display_id  = row.invoice["invoice_id"]
         db_id       = row.invoice.get("_db_id", display_id)
         confidence  = row.invoice.get("_confidence") or 0.0
         matched_ids = row.invoice.get("_matched_ids") or []
-
-        if not messagebox.askyesno("Confirm Approval",
-                                   "Manually approve invoice {}?\n\n"
-                                   "This will mark it as validated in the database.".format(display_id)):
-            return
 
         row.set_approved()
         for inv in self._invoices:
