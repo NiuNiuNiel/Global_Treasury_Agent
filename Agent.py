@@ -408,7 +408,6 @@ class Agent():
 
         # 3. Calculate Confidence Score
         for scenario in matching_candidates:
-            scenario_actual_amount = 0.0
             scenario_expected_amount = 0.0
 
             for txn_id in scenario:
@@ -418,24 +417,23 @@ class Agent():
                 if not txn or not loss:
                     continue
 
-                # Add up the actual transaction amounts from the database
-                scenario_actual_amount += float(txn["amount"])
-
                 # Extract loss parameters
                 exchange_rate = loss["Exchange_Rate"]
                 fixed_fee = loss["Fixed_Fee_Amount"]
                 percentage_rate = loss["Percentage_Fee_Rate"]
 
                 # Calculate exactly as your workflow diagram dictates
-                converted_gross = invoice_amount * exchange_rate
+                converted_gross = float(txn["amount"]) / exchange_rate
                 platform_fees = fixed_fee + (converted_gross * percentage_rate)
-                expected_amount = converted_gross - platform_fees
+                expected_amount = converted_gross + platform_fees
 
                 scenario_expected_amount += expected_amount
 
+            print(invoice_amount, scenario_expected_amount)
+
             # Guard against division by zero
-            if scenario_actual_amount > 0:
-                confidence = (scenario_expected_amount / scenario_actual_amount) * 100
+            if scenario_expected_amount > 0:
+                confidence = (scenario_expected_amount / invoice_amount) * 100
 
                 # Penalize variances in both directions (e.g., if confidence is 105%, it's functionally a 95% match)
                 if confidence > 100.0:
