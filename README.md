@@ -1,4 +1,3 @@
-[README (1).md](https://github.com/user-attachments/files/28217221/README.1.md)
 # Global Treasury Agent
 
 An AI-powered invoice validation dashboard that automatically matches uploaded invoices against bank transaction records. The agent extracts invoice data (via OCR for images, or direct text extraction for PDFs and Word documents), filters candidate transactions from a PostgreSQL database, and uses a multi-model LLM pipeline to reconcile payments — accounting for exchange rate variances, platform fees, and split-payment scenarios.
