@@ -1,0 +1,44 @@
+INSERT INTO transactions (transaction_id, bank_name, transaction_datetime, amount, currency, description)
+VALUES (
+    'TXN-INV17110002',
+    'Maybank',
+    '2017-11-06 10:00:00',
+    2542.94,
+    'MYR',
+    'Payment - Mobile Phone Trading 2014 - INV-1711-0002 - Apple iPhone 5'
+),
+(
+    'TXN-MBB-20230510-0058',
+    'Maybank',
+    '2023-05-10 14:32:00',
+    31487.50,
+    'MYR',
+    'Payment - SL Software Solutions Sdn Bhd PINV-0058'
+),
+(
+    'TXN-MBB-20230512',
+    'Maybank',
+    '2023-05-12 09:15:00',
+    15000.00,
+    'MYR',
+    'Vendor payment'
+),
+(
+    'TXN-I000006',
+    'Maybank',
+    '2009-10-10 10:00:00',
+    2068.00,
+    'MYR',
+    'Payment - Learning Autocount Sdn Bhd - I-000006 - Nokia Item 123 x2, Samsung SGH-E500'
+),
+('TXN-MYR-000142811', 'CIMB', '2026-05-27 09:00:00', 9000.0000, 'MYR', 'Invoice AU326748'),
+('TXN-MYR-000157745', 'CIMB', '2026-05-28 14:15:00', 9342.0000, 'MYR', 'Invoice AU326748'),
+(
+    'TXN-I000012',
+    'Maybank',
+    '2025-02-18 10:00:00',
+    500.00,
+    'MYR',
+    NULL
+),
+('TXN-MANUAL-001', 'Maybank', '2012-10-07 10:15:00', 14000.0000, 'USD', 'Payment for Invoice 30934 - SuperStore');
